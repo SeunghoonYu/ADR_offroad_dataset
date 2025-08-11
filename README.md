@@ -1,8 +1,8 @@
 # ADR_offroad_dataset
 
 ## Keyboard Control Guide
-<img src="assets/offroad_vis_tool_keyboard_manual1.png" width="500">
-<img src="assets/offroad_vis_tool_keyboard_manual2.png" width="500">
+<img src="assets/offroad_vis_tool_keyboard_manual1.png" width="1000">
+<img src="assets/offroad_vis_tool_keyboard_manual2.png" width="1000">
 
 ### 1. Exit Program
 - **`ESC`** or **`q`** → Exit the program
