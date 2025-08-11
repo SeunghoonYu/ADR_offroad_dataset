@@ -474,6 +474,7 @@ project_lidar = False
 selected_cam = None          # 선택된 카메라 인덱스 (0~5)
 control_mode = None          # 'cam' | 'lidar' | 'all' | None
 global_step_size = 1
+single_step = 1
 
 segment_id = 1 # 1부터 시작: start1/end1, start2/end2 ...
 current_phase = None
@@ -562,19 +563,19 @@ while True:
     # --- a/d 이동 ---
     elif key == ord('a'):
         if control_mode == 'cam' and selected_cam is not None:
-            step_cam(selected_cam, -global_step_size)
+            step_cam(selected_cam, -single_step)
         elif control_mode == 'lidar':
-            lidar_idx = max(0, lidar_idx - global_step_size)
+            lidar_idx = max(0, lidar_idx - single_step)
         elif control_mode == 'all':
-            step_all(-global_step_size)
+            step_all(-single_step)
 
     elif key == ord('d'):
         if control_mode == 'cam' and selected_cam is not None:
-            step_cam(selected_cam, global_step_size)
+            step_cam(selected_cam, single_step)
         elif control_mode == 'lidar':
-            lidar_idx = min(len(lidar_files) - 1, lidar_idx + global_step_size)
+            lidar_idx = min(len(lidar_files) - 1, lidar_idx + single_step)
         elif control_mode == 'all':
-            step_all(global_step_size)
+            step_all(single_step)
 
     elif key == ord('s'):
         if allowed_next != "start":
