@@ -1,0 +1,259 @@
+# calib_6cams.yaml
+version: 1
+
+projection:
+  mode: "undistorted"  # 또는 "original" / (ROS-rectify 경로를 쓰면 이 값은 무시 가능)
+
+image:
+  width: 1920
+  height: 1200
+
+undistort:
+  alpha: 1.0  # OpenCV K_new 경로 사용할 때만 의미 있음(ROS P 경로에선 ROI가 대신 처리)
+
+conventions:
+  transform_format: "parent<-child"      # p_parent = T_parent_child * p_child
+  rotation:
+    type: "ypr"                          # yaw(Z), pitch(Y), roll(X)  (ZYX)
+    units: "rad"
+    order: ["Z","Y","X"]
+
+frames:
+  lidar: "hesai_lidar"
+
+cameras:
+  - name: "camera_1"
+    frame_id: "pylon_camera1"
+    rotated_frame_id: "rotated_pylon_camera1"
+
+    # --- 기본 intrinsics / distortion (기존 사용 경로) ---
+    intrinsics:
+      K: [[1157.57, 0.0, 939.82],
+          [0.0, 1159.39, 638.902],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.253281, 0.137763, -0.000739438, 0.000339436, -0.0514238]
+
+    # --- ROS CameraInfo 기반 보정/투영 경로에 필요한 정보 ---
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1157.57, 0.0, 939.82],
+          [0.0, 1159.39, 638.902],
+          [0.0, 0.0, 1.0]]
+      D: [-0.253281, 0.137763, -0.000739438, 0.000339436, -0.0514238]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1157.57, 0.0, 939.82, 0.0],
+          [0.0, 1159.39, 638.902, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:    # rotated_pylon_camera1 <- pylon_camera1
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:     # rotated_pylon_camera1 <- hesai_lidar
+      parent: "rotated_pylon_camera1"
+      child:  "hesai_lidar"
+      translation: [-0.266664, 0.0103389, 0.113768]
+      rotation_ypr: [-1.59181, -0.00601346, 0.0254429]
+
+  - name: "camera_2"
+    frame_id: "pylon_camera2"
+    rotated_frame_id: "rotated_pylon_camera2"
+
+    intrinsics:
+      K: [[1175.05, 0.0, 965.39],
+          [0.0, 1177.3, 622.816],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.246918, 0.124671, 0.001609, -0.0008938, -0.039006]
+
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1175.05, 0.0, 965.39],
+          [0.0, 1177.3, 622.816],
+          [0.0, 0.0, 1.0]]
+      D: [-0.246918, 0.124671, 0.001609, -0.0008938, -0.039006]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1175.05, 0.0, 965.39, 0.0],
+          [0.0, 1177.3, 622.816, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:
+      parent: "rotated_pylon_camera2"
+      child:  "hesai_lidar"
+      translation: [-0.233412, 0.00677967, 0.118833]
+      rotation_ypr: [-2.64283, 0.013577, 0.0140809]
+
+  - name: "camera_3"
+    frame_id: "pylon_camera3"
+    rotated_frame_id: "rotated_pylon_camera3"
+
+    intrinsics:
+      K: [[1167.95, 0.0, 950.315],
+          [0.0, 1170.37, 623.004],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.247642, 0.121018, 0.00068415, -0.000521877, -0.0353057]
+
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1167.95, 0.0, 950.315],
+          [0.0, 1170.37, 623.004],
+          [0.0, 0.0, 1.0]]
+      D: [-0.247642, 0.121018, 0.00068415, -0.000521877, -0.0353057]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1167.95, 0.0, 950.315, 0.0],
+          [0.0, 1170.37, 623.004, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:
+      parent: "rotated_pylon_camera3"
+      child:  "hesai_lidar"
+      translation: [-0.258715, 0.0108505, 0.118548]
+      rotation_ypr: [2.58564, 0.0317586, 0.00303284]
+
+  - name: "camera_4"
+    frame_id: "pylon_camera4"
+    rotated_frame_id: "rotated_pylon_camera4"
+
+    intrinsics:
+      K: [[1168.59, 0.0, 971.419],
+          [0.0, 1170.02, 640.271],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.250555, 0.126859, 0.000647358, -0.000281171, -0.0397222]
+
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1168.59, 0.0, 971.419],
+          [0.0, 1170.02, 640.271],
+          [0.0, 0.0, 1.0]]
+      D: [-0.250555, 0.126859, 0.000647358, -0.000281171, -0.0397222]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1168.59, 0.0, 971.419, 0.0],
+          [0.0, 1170.02, 640.271, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:
+      parent: "rotated_pylon_camera4"
+      child:  "hesai_lidar"
+      translation: [-0.265459, 0.0029477, 0.116637]
+      rotation_ypr: [1.57291, 0.0105595, -0.0210862]
+
+  - name: "camera_5"
+    frame_id: "pylon_camera5"
+    rotated_frame_id: "rotated_pylon_camera5"
+
+    intrinsics:
+      K: [[1166.81, 0.0, 932.205],
+          [0.0, 1169.31, 629.438],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.249168, 0.121314, 0.00144773, -0.00153088, -0.0354392]
+
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1166.81, 0.0, 932.205],
+          [0.0, 1169.31, 629.438],
+          [0.0, 0.0, 1.0]]
+      D: [-0.249168, 0.121314, 0.00144773, -0.00153088, -0.0354392]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1166.81, 0.0, 932.205, 0.0],
+          [0.0, 1169.31, 629.438, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:
+      parent: "rotated_pylon_camera5"
+      child:  "hesai_lidar"
+      translation: [-0.261561, 0.0223422, 0.121189]
+      rotation_ypr: [0.49344, -0.00747478, -0.0163129]
+
+  - name: "camera_6"
+    frame_id: "pylon_camera6"
+    rotated_frame_id: "rotated_pylon_camera6"
+
+    intrinsics:
+      K: [[1167.28, 0.0, 955.029],
+          [0.0, 1168.32, 620.063],
+          [0.0, 0.0, 1.0]]
+    distortion:
+      model: "plumb_bob"
+      order: ["k1","k2","p1","p2","k3"]
+      coeffs: [-0.247692, 0.117205, 0.000226438, -0.000572604, -0.0324496]
+
+    ros_caminfo:
+      width: 1920
+      height: 1200
+      binning_x: 1
+      binning_y: 1
+      roi: { x_offset: 0, y_offset: 0, width: 1920, height: 1200 }
+      K: [[1167.28, 0.0, 955.029],
+          [0.0, 1168.32, 620.063],
+          [0.0, 0.0, 1.0]]
+      D: [-0.247692, 0.117205, 0.000226438, -0.000572604, -0.0324496]
+      R: [[1.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0],
+          [0.0, 0.0, 1.0]]
+      P: [[1167.28, 0.0, 955.029, 0.0],
+          [0.0, 1168.32, 620.063, 0.0],
+          [0.0, 0.0, 1.0, 0.0]]
+
+    rotcam_extrinsic:
+      translation: [0.0, 0.0, 0.0]
+      rotation_ypr: [-1.57079632679, 0.0, -1.57079632679]
+    lidar_extrinsic:
+      parent: "rotated_pylon_camera6"
+      child:  "hesai_lidar"
+      translation: [-0.259178, 0.010763, 0.116589]
+      rotation_ypr: [-0.533295, -0.0197929, 0.00398959]
