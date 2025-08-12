@@ -31,12 +31,12 @@ run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 marks_json_path = marks_dir / f"sync_marks_{run_ts}.json"
 
 # 시작 인덱스
-idx_start = 50
+idx_start = 0
 
 # 거리 색칠 기준: "depth"(Z) 또는 "range"(sqrt(X^2+Y^2+Z^2))
 color_metric = "range"
 # 컬러맵 거리 범위(m): 자동(분위수) = None, 고정 = (vmin, vmax)
-fixed_dist_range = (0.0, 24.0)  # 또는 None
+fixed_dist_range = (0.0, 32.0)  # 또는 None
 
 # =========================
 # 1) 회전/변환 유틸
@@ -370,8 +370,12 @@ def project_one_cam(i, img_idx_i, lidar_idx, draw_lidar=True):
             vmin, vmax = fixed_dist_range
             colors_bgr = distance_colors_bgr(pts_c_in, vmin=vmin, vmax=vmax, metric=color_metric)
 
+        overlay = img_disp.copy()
         for (u, v), c in zip(uv_int, colors_bgr):
             cv2.circle(img_disp, (int(u), int(v)), 2, (int(c[0]), int(c[1]), int(c[2])), -1, lineType=cv2.LINE_AA)
+
+        alpha_pts = 0.35
+        cv2.addWeighted(overlay,alpha_pts, img_disp, 1-alpha_pts, 0, dst=img_disp)
 
     # label = f"Cam{i+1} {_ts(files[img_idx_i])} LiDAR {lidar_idx}" + ("" if draw_lidar else " [LIDAR OFF]")
     label = f"Cam{i+1} {img_idx_i} LiDAR {lidar_idx}" + ("" if draw_lidar else " [LIDAR OFF]")
@@ -508,6 +512,12 @@ def build_canvas(imgs):
         can[y0:y0+h, x0:x0+w] = img
     return can
 
+def read_key_blocking_and_flush():
+    k = cv2.waitKey(0)  # 하나만 받음 (blocking)
+    # 남은 키 이벤트를 모두 소모
+    while cv2.waitKey(1) != -1:
+        pass
+    return k & 0xFF
 
 while True:
     imgs = [project_one_cam(i, img_idx[i], lidar_idx, draw_lidar=project_lidar) for i in range(6)]
@@ -515,7 +525,11 @@ while True:
     overlay_segment_marks(can, current_phase, snap_start, snap_end, segment_id)
     cv2.imshow("Camera-LiDAR Projection tool", can)
 
-    key = cv2.waitKey(0) & 0xFF
+    # OpenCV 창을 앞으로 가져와서 포커스 유지
+    cv2.setWindowProperty("Camera-LiDAR Projection tool", cv2.WND_PROP_TOPMOST, 1)
+    cv2.setWindowProperty("Camera-LiDAR Projection tool", cv2.WND_PROP_TOPMOST, 0)
+
+    key = read_key_blocking_and_flush()
 
     def step_cam(i, delta):
         img_idx[i] = max(0, min(len(camera_files[i]) - 1, img_idx[i] + delta))
