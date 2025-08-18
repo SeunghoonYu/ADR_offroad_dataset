@@ -19,8 +19,9 @@ from typing import List
 # =========================
 # 0) 사용자 설정
 # =========================
-base_dir  = Path("/media/ysh/T7/snu_mt_0807/test0807_15_11")
-yaml_path = Path("/home/ysh/off-road/tools/calib_matrix/matrix0801.yaml")
+
+base_dir  = Path("/mnt/e/off-road/test0807_15_11")
+yaml_path = Path("/home/ysh/git/ADR_offroad_dataset/calib_matrix/matrix0801.yaml")
 
 camera_dirs = [base_dir / "decoded_rgb" / f"camera_{i}" for i in range(1, 7)]
 lidar_dir   = base_dir / "lidar_xyzi"
@@ -309,7 +310,9 @@ if all(len(v)>0 for v in raw_times.values()):
     rel_times = {s: np.array(v) - t0 for s,v in raw_times.items()}
 
     plt.ion()
-    fig, ax = plt.subplots(figsize=(12,4))
+    fig, ax = plt.subplots(figsize=(16,4))
+    fig.canvas.manager.set_window_title("Sensor Timeline (LiDAR + 6 Cams)")  # 창 제목
+    ax.set_title("Sensor Timeline")  # 플롯 내부 제목(옵션)
     ax.invert_yaxis()
     y = np.arange(len(sensor_names))
     blue_len, red_len = 0.7, 0.7
@@ -318,7 +321,7 @@ if all(len(v)>0 for v in raw_times.values()):
     ax.set_yticks(y); ax.set_yticklabels(sensor_names)
     ax.set_xlabel('Elapsed time (s)')
     ax.grid(axis='x', ls='--', alpha=.3); fig.tight_layout()
-    view_span, blue_span = 0.7, 3.0
+    view_span, blue_span = 1.0, 5.0
 
     def update_tl(cur_lidar_idx, img_idx_list):
         cur = [parse_ts(lidar_files[cur_lidar_idx]) - t0] + [parse_ts(camera_files[i][img_idx_list[i]]) - t0 for i in range(6)]
@@ -518,6 +521,8 @@ def read_key_blocking_and_flush():
     while cv2.waitKey(1) != -1:
         pass
     return k & 0xFF
+
+update_tl(lidar_idx, img_idx)
 
 while True:
     imgs = [project_one_cam(i, img_idx[i], lidar_idx, draw_lidar=project_lidar) for i in range(6)]
