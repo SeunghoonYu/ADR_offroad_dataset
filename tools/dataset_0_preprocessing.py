@@ -9,7 +9,7 @@ import sensor_msgs_py.point_cloud2 as pc2
 from rclpy.serialization import deserialize_message
 
 # ====== 공통 설정 ======
-INPUT_BASE = '/media/ysh/T7/sensor_setup/test0725_20_30_forward_slow'
+INPUT_BASE = 'E:/off-road/test0807_15_11'
 
 # ====== LiDAR 설정 ======
 LIDAR_INPUT_DIR = os.path.join(INPUT_BASE, 'lidar')
