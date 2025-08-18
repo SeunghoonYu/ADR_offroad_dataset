@@ -314,13 +314,13 @@ def parse_args():
     parser.add_argument(
         "--json",
         type=str,
-        default="/media/ysh/T7/snu_mt_0807/test0807_15_11/marks_json/sync_marks_20250809_215246.json",
+        default="/mnt/e/off-road/test0807_15_11/marks_json/sync_marks_20250818_122434.json",
         help="Path to marks json file"
     )
     parser.add_argument(
         "--yaml",
         type=str,
-        default="/home/ysh/off-road/tools/calib_matrix/matrix0801.yaml",
+        default="/home/ysh/git/ADR_offroad_dataset/calib_matrix/matrix0801.yaml",
         help="Path to calibration yaml"
     )
     parser.add_argument(
