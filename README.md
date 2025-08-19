@@ -1,4 +1,8 @@
 # ADR_offroad_dataset
+<h1 align="center">
+  <img src="assets/off-road_logo_sample.png" alt="ADR Offroad Logo" width="80"/>
+  ADR Offroad Dataset
+</h1>
 
 ## ADR offroad dataset post-processing tool
 <img src="assets/offroad_vis_test1.png" width="1000">
