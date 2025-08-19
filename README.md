@@ -1,4 +1,3 @@
-# ADR_offroad_dataset
 <h1 align="center">
   <img src="assets/off-road_logo_sample.png" alt="ADR Offroad Logo" width="80"/>
   ADR Offroad Dataset
