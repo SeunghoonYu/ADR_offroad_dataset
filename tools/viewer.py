@@ -351,7 +351,11 @@ def _build_snapshot(label: str, lidar_idx: int, cam_idx_list: List[int]) -> dict
         'label': label,
         'timestamp': dt.datetime.now().isoformat(),
         'lidar_idx': int(lidar_idx),
-        'cam_indices': list(cam_idx_list)   # ← 리스트 복사!
+        'cam_indices': list(cam_idx_list),   # ← 리스트 복사!
+        "files": {
+            "lidar": str(lidar_files[lidar_idx]) if 0 <= lidar_idx < len(lidar_files) else None,
+            "cams": [str(camera_files[i][cam_idx_list[i]]) if (0 <= cam_idx_list[i] < len(camera_files[i])) else None for i in range(6)]
+        }
     }
 
 def _append_json(json_path: Path, obj: dict) -> None:
