@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 from PyQt6 import QtCore, QtGui, QtWidgets
 import datetime as dt
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6 import QtCore
 # =========================
@@ -605,35 +605,72 @@ def overlay_segment_marks(canvas, phase, snap_start, snap_end, segment_id,
 # =========================
 # 7) PyQt6 UI 클래스들
 # =========================
-
 class ImageLabel(QtWidgets.QLabel):
-    """이미지(QImage)를 보여주는 라벨."""
+    clicked = pyqtSignal(int, int)  # (ix, iy) - 원본 캔버스 좌표
+
     def __init__(self):
         super().__init__()
         self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(640, 480)
         self.setStyleSheet("background-color: black;")
+        # 원본 이미지 크기와 표시된 픽스맵 영역 기록
+        self._img_w = None
+        self._img_h = None
+        self._disp_w = None
+        self._disp_h = None
+        self._disp_x0 = 0   # 라벨 내부에서 표시 시작 좌측상단 x
+        self._disp_y0 = 0   # 라벨 내부에서 표시 시작 좌측상단 y
 
     def show_ndarray(self, img_bgr: np.ndarray):
         if img_bgr is None:
             return
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = img_rgb.shape
+        self._img_w, self._img_h = w, h
+
         qimg = QtGui.QImage(img_rgb.data, w, h, ch * w, QtGui.QImage.Format.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg)
-        self.setPixmap(pix.scaled(
-        self.size(),
-        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-        QtCore.Qt.TransformationMode.SmoothTransformation
-    ))
+
+        # 실제로 표시될 크기 계산 (비율 유지)
+        scaled = pix.scaled(
+            self.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation
+        )
+        self.setPixmap(scaled)
+
+        # 라벨 내부에서 가운데 정렬된 위치 기록
+        lw, lh = self.width(), self.height()
+        self._disp_w, self._disp_h = scaled.width(), scaled.height()
+        self._disp_x0 = (lw - self._disp_w) // 2
+        self._disp_y0 = (lh - self._disp_h) // 2
 
     def resizeEvent(self, e):
-        # 리사이즈 시 현재 pixmap을 비율 유지로 다시 맞춤
         if self.pixmap():
-            self.setPixmap(self.pixmap().scaled(
-                self.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation))
+            scaled = self.pixmap().scaled(
+                self.size(),
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.SmoothTransformation
+            )
+            self.setPixmap(scaled)
+            # 리사이즈 시 표시 위치 갱신
+            lw, lh = self.width(), self.height()
+            self._disp_w, self._disp_h = scaled.width(), scaled.height()
+            self._disp_x0 = (lw - self._disp_w) // 2
+            self._disp_y0 = (lh - self._disp_h) // 2
         super().resizeEvent(e)
+
+    def mousePressEvent(self, ev: QtGui.QMouseEvent):
+        if self._img_w is None or self._disp_w is None:
+            return super().mousePressEvent(ev)
+        x, y = ev.position().x(), ev.position().y()
+        # 표시 영역 안인지 확인
+        if (self._disp_x0 <= x <= self._disp_x0 + self._disp_w) and (self._disp_y0 <= y <= self._disp_y0 + self._disp_h):
+            # 라벨 좌표 → 원본 이미지(캔버스) 좌표로 역변환
+            rx = (x - self._disp_x0) * (self._img_w / self._disp_w)
+            ry = (y - self._disp_y0) * (self._img_h / self._disp_h)
+            self.clicked.emit(int(rx), int(ry))
+        return super().mousePressEvent(ev)
 
 
 class Viewer(QtWidgets.QMainWindow):
@@ -669,6 +706,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         # ---- 중앙 이미지 ----
         self.view = ImageLabel()
+        self.view.clicked.connect(self.on_canvas_click)  # ← 추가
 
         # ---- 오른쪽 패널 ----
         panel = self._build_right_panel()
@@ -812,6 +850,25 @@ class Viewer(QtWidgets.QMainWindow):
 
         v.addStretch(1)
         return w
+    def on_canvas_click(self, ix: int, iy: int):
+        tile_w, tile_h = 640, 480
+        grid_rows, grid_cols = 2, 3
+        image_area_h = tile_h * grid_rows  # 960
+        image_area_w = tile_w * grid_cols  # 1920
+
+        # 타임라인 영역 클릭은 무시
+        if ix < 0 or iy < 0 or ix >= image_area_w or iy >= image_area_h:
+            return
+
+        col = ix // tile_w
+        row = iy // tile_h
+        tile_idx = int(row * grid_cols + col)
+
+        # build_canvas에서 사용한 순서
+        order = [1, 0, 5, 4, 3, 2]  # [Cam2, Cam1, Cam6, Cam5, Cam4, Cam3]
+        if 0 <= tile_idx < len(order):
+            cam_orig = order[tile_idx]          # 0-based 카메라 인덱스
+            self.cmb_control.setCurrentText(f"Cam{cam_orig+1}")  # on_control_mode_changed 트리거
 
     def _sep(self, text: str) -> QtWidgets.QWidget:
         box = QtWidgets.QWidget()
@@ -1010,11 +1067,28 @@ class Viewer(QtWidgets.QMainWindow):
                 point_radius=self.point_radius
             ))
         can = build_canvas(imgs)
-        
-        # Add segment marks overlay
+
+        # === 선택된 카메라 빨간 테두리 ===
+        if self.control_mode.startswith("cam"):
+            try:
+                sel_cam = int(self.control_mode[-1]) - 1  # 0-based
+            except Exception:
+                sel_cam = None
+            if sel_cam is not None and 0 <= sel_cam < 6:
+                # build_canvas의 타일 순서와 역매핑
+                order = [1, 0, 5, 4, 3, 2]
+                # 타일 인덱스 찾기
+                tile_idx = order.index(sel_cam)
+                tile_w, tile_h = 640, 480
+                x0 = (tile_idx % 3) * tile_w
+                y0 = (tile_idx // 3) * tile_h
+                # 테두리 (BGR: 빨강)
+                cv2.rectangle(can, (x0+3, y0+3), (x0 + tile_w - 3, y0 + tile_h - 3),
+                            (0, 0, 255), thickness=6, lineType=cv2.LINE_AA)
+
+        # 타임라인 합성
         overlay_segment_marks(can, self.current_phase, self.snap_start, self.snap_end, self.segment_id, 
                             self.lidar_idx, self.img_idx, self.control_mode)
-        
         return can
 
     def _refresh(self):
