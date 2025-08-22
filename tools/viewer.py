@@ -39,8 +39,9 @@ def load_scene_meta():
 def load_camera_and_lidar_files():
     """Load camera and LiDAR file paths"""
     # Camera directories (상위 디렉토리 기준)
-    camera_dirs = [Path("./decoded_rgb") / f"camera_{i}" for i in range(1, 7)]
-    lidar_dir = Path("./lidar_xyzi")
+    base_dir = Path("/mnt/e/off-road/test0807_15_11")
+    camera_dirs = [base_dir / "decoded_rgb" / f"camera_{i}" for i in range(1, 7)]
+    lidar_dir = base_dir / "lidar_xyzi"
     
     # Load camera files
     camera_files = []
@@ -679,11 +680,14 @@ class Viewer(QtWidgets.QMainWindow):
         self.setWindowTitle("SNU Mountain Dataset Viewer (PyQt6)")
         self.resize(1500, 900)
 
+        self._busy: bool = False            
+        self._pending_action = None         
+
         # ---- 상태 ----
         self.num_cams = 6
         self.img_idx: List[int] = [0] * self.num_cams
         self.lidar_idx: int = 0
-        self.project_lidar: bool = True
+        self.project_lidar: bool = False
         self.point_radius: int = 2
         self.step_size: int = 1
         self.allowed_next: str = "start"  # "start" -> "end" 토글
@@ -720,6 +724,22 @@ class Viewer(QtWidgets.QMainWindow):
         self.setCentralWidget(splitter)
         self._init_shortcuts()
         self._refresh()  # 초기 렌더
+
+    def _run_or_queue(self, fn):
+        """진행 중이면 첫 요청만 큐잉, 아니면 즉시 실행."""
+        if self._busy:
+            if self._pending_action is None:
+                self._pending_action = fn
+            return
+        self._busy = True
+        try:
+            fn()
+        finally:
+            self._busy = False
+            if self._pending_action:
+                nxt = self._pending_action
+                self._pending_action = None
+                QtCore.QTimer.singleShot(0, nxt)
 
     # ========== UI 구성 ==========
     def _build_right_panel(self) -> QtWidgets.QWidget:
@@ -909,32 +929,52 @@ class Viewer(QtWidgets.QMainWindow):
             self.sld.blockSignals(True)
             self.sld.setValue(self.lidar_idx)
             self.sld.blockSignals(False)
+            
     def _init_shortcuts(self):
-    # 숫자 1~6 -> Cam1~Cam6
+        # 숫자 1~6 -> Cam1~Cam6
         for n in range(1, 7):
             sc = QShortcut(QKeySequence(str(n)), self)
-            sc.activated.connect(lambda n=n: self._set_control_mode_cam(n))
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.setAutoRepeat(False)  # ← 중요
+            sc.activated.connect(lambda n=n: self._run_or_queue(lambda: self._set_control_mode_cam(n)))
 
-        # L / l -> LiDAR
+        # L -> LiDAR
         sc_l = QShortcut(QKeySequence(QtCore.Qt.Key.Key_L), self)
         sc_l.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_l.activated.connect(self._set_control_mode_lidar)
+        sc_l.setAutoRepeat(False)
+        sc_l.activated.connect(lambda: self._run_or_queue(self._set_control_mode_lidar))
+
+        # , / . -> 개별 이동(현 모드 유지)
         sc_comma  = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Comma),  self)
         sc_period = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Period), self)
-        sc_comma.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_period.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_comma.activated.connect(lambda: self._individual_step(-self.individual_step))
-        sc_period.activated.connect(lambda: self._individual_step(+self.individual_step))
+        for sc in (sc_comma, sc_period):
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.setAutoRepeat(False)
+        sc_comma.activated.connect(lambda: self._run_or_queue(lambda: self._individual_step(-self.individual_step)))
+        sc_period.activated.connect(lambda: self._run_or_queue(lambda: self._individual_step(+self.individual_step)))
 
-        # 좌우 화살표 -> 전체 Prev/Next (현재 step 크기 사용)
+        sc_a = QShortcut(QKeySequence(QtCore.Qt.Key.Key_A), self)
+        sc_d = QShortcut(QKeySequence(QtCore.Qt.Key.Key_D), self)
+        for sc in (sc_a, sc_d):
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.setAutoRepeat(False)
+        sc_a.activated.connect(lambda: self._run_or_queue(lambda: self._individual_step(-self.individual_step)))
+        sc_d.activated.connect(lambda: self._run_or_queue(lambda: self._individual_step(+self.individual_step)))
+
+        # ← / → -> 전역 이동 + All 모드로 전환(빨간 박스 제거)
         sc_left  = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Left),  self)
         sc_right = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Right), self)
-        sc_left.activated.connect(lambda: self._relative_step(-self.step_size))
-        sc_right.activated.connect(lambda: self._relative_step(+self.step_size))
-        
+        for sc in (sc_left, sc_right):
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.setAutoRepeat(False)
+        sc_left.activated.connect(lambda: self._run_or_queue(self._jump_global_prev))
+        sc_right.activated.connect(lambda: self._run_or_queue(self._jump_global_next))
+
+        # Space -> LiDAR 토글
         sc_space = QShortcut(QKeySequence(QtCore.Qt.Key.Key_Space), self)
         sc_space.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_space.activated.connect(self._toggle_lidar_visibility)
+        sc_space.setAutoRepeat(False)
+        sc_space.activated.connect(lambda: self._run_or_queue(self._toggle_lidar_visibility))
 
     def _toggle_lidar_visibility(self):
         # 체크박스를 토글하면 on_lidar_toggle 신호가 자동으로 호출되어 화면 갱신됨
@@ -1056,6 +1096,17 @@ class Viewer(QtWidgets.QMainWindow):
 
     def _refresh_state_label(self):
         self.lbl_state.setText(f"allowed_next: {self.allowed_next}   (segment_id={self.segment_id})")
+
+    def _jump_global_prev(self):
+        if self.control_mode != "all":
+            self.cmb_control.setCurrentText("All")  # 선택 해제(빨간 박스 사라짐)
+        self._relative_step(-self.step_size)
+
+    def _jump_global_next(self):
+        if self.control_mode != "all":
+            self.cmb_control.setCurrentText("All")
+        self._relative_step(+self.step_size)
+
 
     # ========== 렌더/정보 ==========
     def _render_canvas(self) -> np.ndarray:
