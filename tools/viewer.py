@@ -16,12 +16,45 @@ import copy
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+import shutil
 from PyQt6 import QtCore, QtGui, QtWidgets
 import datetime as dt
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6 import QtCore
+from dataclasses import dataclass
+
+# =========================
+# 0) CONFIG (한 곳에서 수정)
+# =========================
+@dataclass
+class AppConfig:
+    # 데이터셋 루트 (읽기/marks_json 저장의 기준)
+    base_dir: Path = Path("/mnt/e/off-road/test0807_15_11")
+
+    # 씬 export 네이밍 접두
+    dataset_tag: str = "SNU_mountain"
+
+    # 보정 파일 경로(없으면 기본 파라미터 사용)
+    calib_yaml: Optional[Path] = Path("./calib_matrix/matrix0801.yaml")
+
+    # 서브폴더/이름 규칙들
+    marks_subdir: str = "marks_json"
+    lidar_dirname: str = "lidar_xyzi"
+    camera_root: str = "decoded_rgb"
+    camera_prefix: str = "camera_"   # camera_1 ~ camera_6
+    radar_dirs: Tuple[str, ...] = ("radar1", "radar2", "radar3")
+
+    # 뷰어 디폴트
+    camera_count: int = 6
+    tile_w: int = 640
+    tile_h: int = 480
+    timeline_h: int = 300
+    start_index_default: int = 50
+
+CFG = AppConfig()
+
 # =========================
 # 1) 데이터 로딩 및 설정
 # =========================
@@ -37,13 +70,12 @@ def load_scene_meta():
         return json.load(f)
 
 def load_camera_and_lidar_files():
-    """Load camera and LiDAR file paths"""
-    # Camera directories (상위 디렉토리 기준)
-    base_dir = Path("/mnt/e/off-road/test0807_15_11")
-    camera_dirs = [base_dir / "decoded_rgb" / f"camera_{i}" for i in range(1, 7)]
-    lidar_dir = base_dir / "lidar_xyzi"
+    """Load camera and LiDAR file paths + return base_dir"""
+    base_dir = CFG.base_dir
+    camera_dirs = [base_dir / CFG.camera_root / f"{CFG.camera_prefix}{i}"
+                   for i in range(1, CFG.camera_count + 1)]
+    lidar_dir = base_dir / CFG.lidar_dirname
     
-    # Load camera files
     camera_files = []
     for cam_dir in camera_dirs:
         if cam_dir.exists():
@@ -53,14 +85,15 @@ def load_camera_and_lidar_files():
             print(f"Warning: {cam_dir} not found")
             camera_files.append([])
     
-    # Load LiDAR files
-    lidar_files = []
     if lidar_dir.exists():
         lidar_files = sorted(list(lidar_dir.glob("*.bin")))
     else:
         print(f"Warning: {lidar_dir} not found")
-    
-    return camera_files, lidar_files
+        lidar_files = []
+
+    return camera_files, lidar_files, base_dir
+
+
 
 def parse_ts(p):
     """Parse timestamp from filename"""
@@ -82,6 +115,37 @@ def _ts(p):
         return "_".join(stem[-2:])
     else:  # LiDAR 파일
         return "_".join([stem[-2], stem[-1].replace('xyzi', '')])
+    
+def _extract_sec_nsec(p: Path) -> Optional[Tuple[int, int]]:
+    """
+    파일명(stem)에서 끝의 숫자 2개를 (sec, nsec)으로 인식.
+    예) cam3_frame_0123_1724141253_123456789.jpg
+        lidar_000123_1724141253_123456789xyzi.bin
+        radar1_000246_1724141253_123456789.bin
+    """
+    tokens = Path(p).stem.split('_')
+    nums = []
+    for tok in tokens:
+        m = re.search(r'(\d+)', tok)  # '123456789xyzi' -> '123456789' 매칭
+        if m:
+            nums.append(int(m.group(1)))
+    if len(nums) >= 2:
+        return nums[-2], nums[-1]
+    return None
+
+def ts_float_from_path(p: Path) -> Optional[float]:
+    ss = _extract_sec_nsec(p)
+    if ss is None: 
+        return None
+    sec, nsec = ss
+    return sec + nsec * 1e-9
+
+def ts_str_from_path(p: Path) -> Optional[str]:
+    ss = _extract_sec_nsec(p)
+    if ss is None:
+        return None
+    sec, nsec = ss
+    return f"{sec}_{nsec}"
 
 # =========================
 # 2) 보정 및 변환 유틸리티
@@ -320,7 +384,7 @@ def build_canvas(imgs: List[np.ndarray]) -> np.ndarray:
     imgs = imgs[:6]
 
     # 동일 크기로 리사이즈
-    target_size = (640, 480)
+    target_size = (CFG.tile_w, CFG.tile_h)
     resized = []
     for img in imgs:
         if img is not None and img.size > 0:
@@ -338,10 +402,52 @@ def build_canvas(imgs: List[np.ndarray]) -> np.ndarray:
     canvas = np.vstack([row1, row2])
 
     # 하단 타임라인 영역(300px)
-    bottom_space = np.zeros((300, canvas.shape[1], 3), dtype=np.uint8)
+    bottom_space = np.zeros((CFG.timeline_h, canvas.shape[1], 3), dtype=np.uint8)
     canvas = np.vstack([canvas, bottom_space])
 
     return canvas
+
+# Radar
+# === add near _list_inputs_from_base ===
+def _list_radars_from_base(base_dir: Path):
+    radar_dirs = [base_dir / d for d in CFG.radar_dirs]
+    radar_files = []
+    for d in radar_dirs:
+        radar_files.append(sorted(d.glob("*.bin")) if d.exists() else [])
+    return radar_files, radar_dirs
+
+def _precompute_radar_times(radar_files_lists):
+    """각 레이더 리스트에 대해 float timestamp 배열을 미리 계산"""
+    times = []
+    for files in radar_files_lists:
+        if files:
+            arr = np.array([ts_float_from_path(p) or np.nan for p in files], dtype=np.float64)
+        else:
+            arr = np.array([], dtype=np.float64)
+        times.append(arr)
+    return times
+
+def _nearest_index(times_arr: np.ndarray, t: float) -> Optional[int]:
+    """정렬 가정 하에 t와 가장 가까운 인덱스 반환 (없으면 None)"""
+    if times_arr.size == 0 or not np.isfinite(t):
+        return None
+    # NaN 제거
+    valid = np.isfinite(times_arr)
+    if not valid.any():
+        return None
+    a = times_arr[valid]
+    # 이진탐색
+    idx = np.searchsorted(a, t)
+    cand = []
+    if idx > 0: cand.append(idx - 1)
+    if idx < a.size: cand.append(idx)
+    if not cand:
+        return None
+    # 원본 인덱스로 되돌리기
+    valid_idx = np.flatnonzero(valid)
+    best_local = min(cand, key=lambda j: abs(a[j] - t))
+    return int(valid_idx[best_local])
+
 
 # =========================
 # 6) 스냅샷 및 JSON 유틸리티
@@ -374,6 +480,240 @@ def _append_json(json_path: Path, obj: dict) -> None:
     data.append(obj)
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+# =========================
+# X) Export (copy) helpers
+# =========================
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def copy_file(src: Path, dst: Path):
+    """dst에 동일명이 있으면 덮어씀."""
+    if dst.exists() or dst.is_symlink():
+        try:
+            dst.unlink()
+        except Exception:
+            pass
+    shutil.copy2(src, dst)
+
+def _infer_base_dir_from_marks(data: list) -> Optional[Path]:
+    """
+    marks_json 항목에 저장된 파일 경로(files.lidar / files.cams[0])로부터 base_dir 추정.
+    파일이 실제로 존재하지 않아도 경로 문자열 패턴으로 폴백 추정한다.
+    """
+    for it in data:
+        files = it.get("files", {}) or {}
+
+        # 1) lidar 우선 시도
+        lidar_path = files.get("lidar")
+        if lidar_path:
+            p = Path(lidar_path)
+            # (A) 실제 경로가 있으면 기존 로직
+            if p.exists() and p.parent.name == "lidar_xyzi":
+                return p.parent.parent
+            # (B) 폴백: 문자열 패턴으로 추정 (존재하지 않아도 됨)
+            s = str(lidar_path)
+            m = re.search(r"(.*?)(?:/|\\)lidar_xyzi(?:/|\\)", s)
+            if m:
+                cand = Path(m.group(1))
+                return cand
+
+        # 2) cams
+        cams = files.get("cams", []) or []
+        for c in cams:
+            if not c:
+                continue
+            p = Path(c)
+            # (A) 실제 경로가 있으면 기존 로직
+            if p.exists():
+                # .../decoded_rgb/camera_i/xxx.jpg
+                if p.parent.parent.name == "decoded_rgb":
+                    return p.parent.parent.parent
+            # (B) 폴백: 문자열 패턴으로 추정
+            s = str(c)
+            m = re.search(r"(.*?)(?:/|\\)decoded_rgb(?:/|\\)camera_\d+(?:/|\\)", s)
+            if m:
+                cand = Path(m.group(1))
+                return cand
+
+    return None
+
+def _list_inputs_from_base(base_dir: Path):
+    lidar_dir = base_dir / "lidar_xyzi"
+    cam_dirs  = [base_dir / "decoded_rgb" / f"camera_{i}" for i in range(1,7)]
+    lidar = sorted(lidar_dir.glob("*.bin"))
+    cams  = [sorted(d.glob("*.jpg")) for d in cam_dirs]
+    return lidar, cams
+
+def _pair_segments_from_marks(data: list):
+    """
+    현재 뷰어의 marks 포맷( top-level: lidar_idx / cam_indices )과
+    사용자가 예전에 썼던 포맷( indices: {lidar_idx, cam_idx} ) 둘 다 지원.
+    """
+    def _get_sid(label: str) -> Optional[Tuple[str, int]]:
+        if label.startswith("start"):
+            return ("start", int(label.replace("start", "")))
+        if label.startswith("end"):
+            return ("end", int(label.replace("end", "")))
+        return None
+
+    starts, ends = {}, {}
+    for it in data:
+        label = it.get("label", "")
+        kind_sid = _get_sid(label)
+        if not kind_sid:
+            continue
+        kind, sid = kind_sid
+        if kind == "start": starts[sid] = it
+        else: ends[sid] = it
+
+    scene_ids = sorted(set(starts) & set(ends))
+    pairs = []
+    for sid in scene_ids:
+        st = starts[sid]; ed = ends[sid]
+        # indices 포맷 우선
+        if "indices" in st and "indices" in ed:
+            l0 = int(st["indices"]["lidar_idx"])
+            l1 = int(ed["indices"]["lidar_idx"])
+            c0 = list(map(int, st["indices"]["cam_idx"]))
+            c1 = list(map(int, ed["indices"]["cam_idx"]))
+        else:
+            # 현재 뷰어 포맷: top-level
+            l0 = int(st["lidar_idx"])
+            l1 = int(ed["lidar_idx"])
+            c0 = list(map(int, st["cam_indices"]))
+            c1 = list(map(int, ed["cam_indices"]))
+        pairs.append((sid, (l0, l1), (c0, c1), st, ed))
+    return pairs
+
+def _derive_root_name(base_dir: Path, dataset_tag: Optional[str]) -> str:
+    base_name = base_dir.name  # e.g., "test0807_15_11"
+    if dataset_tag:
+        m = re.search(r"(\d.*)$", base_name)
+        suffix = m.group(1) if m else base_name
+        return f"{dataset_tag}_{suffix}_scenes"
+    else:
+        return f"{base_name}_scenes"
+
+def export_scenes_from_marks(marks_json_path: Path,
+                             dataset_tag: Optional[str] = "SNU_mountain",
+                             log_cb=None,
+                             base_dir_override: Optional[Path] = None):
+    """
+    marks_json을 읽어 start/end 쌍 단위로 실제 파일을
+    {OUT_ROOT}/{root_name}_{sid}/ 이하에 copy.
+    - symlink 미지원, 무조건 copy.
+    """
+    def log(msg):
+        if log_cb: log_cb(msg)
+        else: print(msg)
+
+    # 1) load marks
+    if not marks_json_path.exists():
+        raise FileNotFoundError(f"Marks JSON not found: {marks_json_path}")
+    with open(marks_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("Marks JSON must be a list of entries.")
+
+    # 2) base_dir 추정
+    base_dir = base_dir_override if base_dir_override else _infer_base_dir_from_marks(data)
+    if base_dir is None or not base_dir.exists():
+        raise RuntimeError("Failed to infer base_dir from marks JSON. (files.lidar / files.cams 경로를 확인하세요)")
+
+    lidar_files, cam_files = _list_inputs_from_base(base_dir)
+
+    # radar
+    radar_files, radar_dirs = _list_radars_from_base(base_dir)
+    radar_times = _precompute_radar_times(radar_files)
+
+    root_name = _derive_root_name(base_dir, dataset_tag)
+    out_root = base_dir.parent / root_name
+    ensure_dir(out_root)
+
+    log(f"[info] Base dir     : {base_dir}")
+    log(f"[info] Output root  : {out_root}")
+    log(f"[info] Marks JSON   : {marks_json_path}")
+    log(f"[info] Mode         : copy")
+
+    for i, d in enumerate(radar_dirs, 1):
+        log(f"[info] Radar{i} dir  : {d}  (files={len(radar_files[i-1])})")
+
+    # 3) pair start/end
+    pairs = _pair_segments_from_marks(data)
+    if not pairs:
+        log("[error] No start/end pairs found.")
+        return
+
+    # 4) copy per pair
+    for sid, (l0, l1), (c0, c1), st, ed in pairs:
+        scene_dir = out_root / f"{root_name}_{sid}"
+        out_lidar = scene_dir / "lidar_xyzi"
+        out_cams  = [scene_dir / "decoded_rgb" / f"camera_{i}" for i in range(1,7)]
+        out_radars = [scene_dir / f"radar{i}" for i in range(1,4)]
+
+        ensure_dir(out_lidar)
+        for d in out_cams:
+            ensure_dir(d)
+        for d in out_radars:
+            ensure_dir(d)
+
+        # 범위
+        L_len = max(0, l1 - l0 + 1)
+        C_len = [max(0, c1[i] - c0[i] + 1) for i in range(6)]
+        seg_len = min([L_len] + C_len)
+        if seg_len <= 0:
+            log(f"[warn][scene {sid}] empty segment, skip.")
+            continue
+        if not (L_len == seg_len == C_len[0] == C_len[1] == C_len[2] == C_len[3] == C_len[4] == C_len[5]):
+            log(f"[warn][scene {sid}] length mismatch → truncate to {seg_len} "
+                f"(lidar={L_len}, cams={C_len})")
+
+        for k in range(seg_len):
+            lidar_src = lidar_files[l0 + k]
+            li_ts_str = ts_str_from_path(lidar_src) or _ts(lidar_src)  # 안전장치
+            li_ts_val = ts_float_from_path(lidar_src)
+
+            # LiDAR
+            dst = out_lidar / f"{li_ts_str}_{k:06d}.bin"
+            copy_file(lidar_src, dst)
+
+            # Cams (라이다 접두 사용)
+            for i in range(6):
+                src_cam = cam_files[i][c0[i] + k]
+                dst_cam = out_cams[i] / f"{li_ts_str}_{k:06d}.jpg"
+                copy_file(src_cam, dst_cam)
+
+            # Radars (가장 가까운 타임스탬프 선택 후, 라이다 접두로 저장)
+            for r in range(3):  # radar1..3
+                if not radar_files[r]:
+                    continue
+                idx = _nearest_index(radar_times[r], li_ts_val)
+                if idx is None:
+                    continue
+                src_radar = radar_files[r][idx]
+                dst_radar = out_radars[r] / f"{li_ts_str}_{k:06d}.bin"
+                copy_file(src_radar, dst_radar)
+
+        meta = {
+            "scene_id": sid,
+            "root_name": root_name,
+            "source_base_dir": str(base_dir),
+            "length": seg_len,
+            "lidar_range": [l0, l0 + seg_len - 1],
+            "cam_ranges": [[c0[i], c0[i] + seg_len - 1] for i in range(6)],
+            "mode": "copy",
+            "radars": {
+                "radar1": len(radar_files[0]),
+                "radar2": len(radar_files[1]),
+                "radar3": len(radar_files[2]),
+            }
+        }
+        with open(scene_dir / "scene_meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        log(f"[ok] {scene_dir}  (frames={seg_len})")
 
 def create_timeline_matplotlib(current_lidar_idx, current_img_idx, control_mode,
                                snap_start, snap_end, segment_id, canvas_width, canvas_height):
@@ -591,7 +931,7 @@ def create_timeline_matplotlib(current_lidar_idx, current_img_idx, control_mode,
 def overlay_segment_marks(canvas, phase, snap_start, snap_end, segment_id,
                           current_lidar_idx, current_img_idx, control_mode):
     H, W = canvas.shape[:2]
-    timeline_h = 300
+    timeline_h = CFG.timeline_h
 
     # ✅ 최종 붙일 크기 그대로 생성
     timeline_img = create_timeline_matplotlib(
@@ -684,9 +1024,9 @@ class Viewer(QtWidgets.QMainWindow):
         self._pending_action = None         
 
         # ---- 상태 ----
-        self.num_cams = 6
-        self.img_idx: List[int] = [0] * self.num_cams
-        self.lidar_idx: int = 0
+        self.num_cams = CFG.camera_count
+        self.img_idx: List[int] = [CFG.start_index_default] * self.num_cams
+        self.lidar_idx: int = CFG.start_index_default
         self.project_lidar: bool = False
         self.point_radius: int = 2
         self.step_size: int = 1
@@ -867,6 +1207,24 @@ class Viewer(QtWidgets.QMainWindow):
         # 상태 라벨
         self.lbl_state = QtWidgets.QLabel("allowed_next: start")
         v.addWidget(self.lbl_state)
+        
+        v.addSpacing(8)
+        v.addWidget(self._sep("Export Scenes"))
+
+        # Export 버튼 + 로그창
+        self.btn_export = QtWidgets.QPushButton("Export Scenes (copy)")
+        self.btn_export.clicked.connect(self.on_export_scenes)
+        v.addWidget(self.btn_export)
+
+        self.txt_export = QtWidgets.QTextEdit()
+        self.txt_export.setReadOnly(True)
+        self.txt_export.setMinimumHeight(160)
+        v.addWidget(self.txt_export)
+
+        self.btn_export_latest = QtWidgets.QPushButton("Export Latest marks_json (copy)")
+        self.btn_export_latest.clicked.connect(self.on_export_latest)
+        v.addWidget(self.btn_export_latest)
+
 
         v.addStretch(1)
         return w
@@ -1180,6 +1538,77 @@ class Viewer(QtWidgets.QMainWindow):
         self.view.show_ndarray(self.cached_canvas)
         self._refresh_state_label()
 
+    def _log_export(self, msg: str):
+        self.txt_export.append(msg)
+        self.txt_export.ensureCursorVisible()
+        self.statusBar().showMessage(msg, 3000)
+
+    def on_export_scenes(self):
+        try:
+            default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+            )
+            if not path:
+                return
+
+            self._log_export(f"[run] Export from: {path}")
+            self.btn_export.setEnabled(False)
+            QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+            def _cb(msg):
+                self._log_export(msg)
+
+            # 1차 시도: 자동 추정
+            try:
+                export_scenes_from_marks(Path(path), dataset_tag=CFG.dataset_tag, log_cb=_cb)
+            except RuntimeError as e:
+                if "Failed to infer base_dir" not in str(e):
+                    raise
+                # 2차 시도: 사용자에게 base_dir 선택 받기
+                self._log_export("[hint] Can't infer base dir from JSON. Select the dataset base directory (contains 'lidar_xyzi' and 'decoded_rgb').")
+                base = QtWidgets.QFileDialog.getExistingDirectory(self, "Select dataset base directory")
+                if not base:
+                    self._log_export("[cancel] No base dir selected.")
+                    return
+                base_path = Path(base)
+                if not (base_path / "lidar_xyzi").exists() or not (base_path / "decoded_rgb").exists():
+                    self._log_export("[error] Selected directory does not contain 'lidar_xyzi' and 'decoded_rgb'.")
+                    return
+                export_scenes_from_marks(Path(path), dataset_tag=CFG.dataset_tag, log_cb=_cb, base_dir_override=base_path)
+
+            self._log_export("[done] Export finished.")
+        except Exception as e:
+            self._log_export(f"[error] {e}")
+        finally:
+            self.btn_export.setEnabled(True)
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+
+    def on_export_latest(self):
+        try:
+            mj = (dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")
+            if not mj.exists():
+                self._log_export(f"[error] {mj} not found")
+                return
+            # 🔁 패턴을 *_syn_marks_*.json 으로 변경
+            candidates = sorted(mj.glob("*_syn_marks_*.json"))
+            if not candidates:
+                self._log_export("[error] no *_syn_marks_*.json")
+                return
+            chosen = candidates[-1]
+            self._log_export(f"[run] Export from latest: {chosen}")
+            self.btn_export_latest.setEnabled(False)
+            QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            export_scenes_from_marks(chosen, dataset_tag="SNU_mountain", log_cb=self._log_export)
+            self._log_export("[done] Export finished.")
+        except Exception as e:
+            self._log_export(f"[error] {e}")
+        finally:
+            self.btn_export_latest.setEnabled(True)
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+
 
 # =========================
 # 8) 전역 변수 및 초기화
@@ -1190,36 +1619,41 @@ camera_files: List[List[Path]] = []
 lidar_files: List[Path] = []
 calib_data = None
 marks_json_path: Path = None
+dataset_base_dir: Optional[Path] = None  # ← 이미 선언돼 있으면 그대로 두세요
 
 def initialize_data():
     """Initialize all data structures"""
-    global camera_files, lidar_files, calib_data, marks_json_path
-    
+    global camera_files, lidar_files, calib_data, marks_json_path, dataset_base_dir
+
     print("Loading scene metadata...")
     scene_meta = load_scene_meta()
-    
+
     print("Loading camera and LiDAR files...")
-    camera_files, lidar_files = load_camera_and_lidar_files()
     
+    camera_files, lidar_files, dataset_base_dir = load_camera_and_lidar_files()
+    print(f"Base dir: {dataset_base_dir}")
     print(f"Found {len(lidar_files)} LiDAR files")
-    for i, cam_files in enumerate(camera_files):
-        print(f"Camera {i+1}: {len(cam_files)} files")
-    
-    # Try to load calibration data
+    for i, cam_files_i in enumerate(camera_files):
+        print(f"Camera {i+1}: {len(cam_files_i)} files")
+
+    # Calibration
     calib_path = Path("./calib_matrix/matrix0801.yaml")
     if calib_path.exists():
-        print("Loading calibration data from calib_matrix/matrix0801.yaml...")
+        print(f"Loading calibration data from {calib_path}...")
         calib_data = load_calib_yaml(calib_path)
     else:
         print("No calibration file found, using default parameters")
         calib_data = None
+
     
-    # Setup marks JSON path
-    marks_dir = Path("./marks_json")
+    marks_dir = (dataset_base_dir / "marks_json") if (dataset_base_dir and dataset_base_dir.exists()) else Path("./marks_json")
     marks_dir.mkdir(parents=True, exist_ok=True)
+
     run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    marks_json_path = marks_dir / f"sync_marks_{run_ts}.json"
+    base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
     
+    marks_json_path = marks_dir / f"{base_name}_syn_marks_{run_ts}.json"
+
     print(f"Marks will be saved to: {marks_json_path}")
 
 # =========================
