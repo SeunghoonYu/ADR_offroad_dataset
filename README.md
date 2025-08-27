@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="assets/off-road_logo_sample.png" alt="ADR Offroad Logo" width="80"/>
+  <img src="assets/off-road_logo_sample.png" alt="ADR Offroad Logo" width="120"/>
   ADR Offroad Dataset
 </h1>
 
