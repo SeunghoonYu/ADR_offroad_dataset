@@ -7,40 +7,26 @@
 <img src="assets/offroad_vis_test1.png" width="1000">
 <img src="assets/offroad_vis_test2.png" width="1000">
 
-## Keyboard Control Guide
-<img src="assets/offroad_vis_tool_keyboard_manual1.png" width="1000">
-<img src="assets/offroad_vis_tool_keyboard_manual2.png" width="1000">
-
-### 1. Exit Program
-- **`ESC`** or **`q`** → Exit the program
-
-### 2. Toggle LiDAR Projection
-- **`Space`** → Show / hide LiDAR projection points
-
-### 3. Change Step Size
-- **`b`** → Set step size to **1**
-- **`n`** → Set step size to **5**
-- **`m`** → Set step size to **10**
-
-### 4. Global Synchronized Navigation
-- **`,`** (comma) → Move LiDAR and all cameras **backward** by the current step size  
-- **`.`** (period) → Move LiDAR and all cameras **forward** by the current step size
-
-### 5. Control Mode Selection
-- **`1` ~ `6`** → Select a specific camera (Cam1–Cam6) and activate **single camera control mode**
-- **`l`** → Switch to **LiDAR-only control mode**
-- **`c`** → Switch to **all cameras mode** (all cameras)
-
-### 6. Data Index Navigation
-- **`a`**
-  - **Single camera mode**: Move the selected camera index **backward** by the step size
-  - **LiDAR mode**: Move the LiDAR index **backward** by the step size
-  - **Global mode**: Move all cameras **backward** by the step size
-- **`d`**
-  - **Single camera mode**: Move the selected camera index **forward** by the step size
-  - **LiDAR mode**: Move the LiDAR index **forward** by the step size
-  - **Global mode**: Move all cameras **forward** by the step size
-
-### 7. Segment Marking
-- **`s`** → Save the current indices as **segment start (startN)**
-- **`e`** → Save the current indices as **segment end (endN)**
+## Directory example
+<data_root>/
+└── Gwangmyeong_Hagon_0822_15_22_scenes/
+    └── Gwangmyeong_Hagon_0822_15_22_scenes_<ID>/
+        ├── camera_info/
+        ├── decoded_rgb/
+        │   ├── camera_1/
+        │   ├── camera_2/
+        │   ├── camera_3/
+        │   ├── camera_4/
+        │   ├── camera_5/
+        │   └── camera_6/
+        ├── imu/
+        │   └── imu.csv                 # 선택 구간만, index 0부터 재부여
+        ├── lidar/                      # raw lidar (sec_nsec 매칭)
+        ├── lidar_xyzi/                 # xyzi 포맷 (sec_nsec_######.bin)
+        ├── marks_json/                 # 사용한 마크 파일 백업
+        ├── radar1/
+        ├── radar2/
+        ├── radar3/
+        ├── tf_static/
+        │   └── tf_static.json
+        └── scene_meta.json
