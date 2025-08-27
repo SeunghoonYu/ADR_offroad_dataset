@@ -3,7 +3,7 @@
 """
 6-Cam + 1-LiDAR Visualization Viewer (PyQt6)
 
-Self-contained viewer application for SNU mountain dataset
+Self-contained viewer application for Iffroad dataset
 """
 
 import sys
@@ -15,6 +15,7 @@ import yaml
 import copy
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import shutil
@@ -23,7 +24,10 @@ import datetime as dt
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6 import QtCore
+from PyQt6.QtWidgets import QProgressBar
 from dataclasses import dataclass
+from typing import Callable
+import csv
 
 # =========================
 # 0) CONFIG (한 곳에서 수정)
@@ -31,10 +35,10 @@ from dataclasses import dataclass
 @dataclass
 class AppConfig:
     # 데이터셋 루트 (읽기/marks_json 저장의 기준)
-    base_dir: Path = Path("/mnt/e/off-road/test0807_15_11")
+    base_dir: Path = Path("/mnt/e/off-road/data_0822/test0822_15_22")
 
     # 씬 export 네이밍 접두
-    dataset_tag: str = "SNU_mountain"
+    dataset_tag: str = "Gwangmyeong_Hagon"
 
     # 보정 파일 경로(없으면 기본 파라미터 사용)
     calib_yaml: Optional[Path] = Path("./calib_matrix/matrix0801.yaml")
@@ -52,6 +56,13 @@ class AppConfig:
     tile_h: int = 480
     timeline_h: int = 300
     start_index_default: int = 50
+
+    # --- LiDAR 표시/색상 ---
+    lidar_cmap: str = "turbo_r"              # 예: "turbo", "viridis", "plasma", "jet", ...
+    lidar_color_use_fixed_range: bool = True
+    lidar_color_min_m: float = 0.0         
+    lidar_color_max_m: float = 50.0        
+    lidar_max_display_range_m: float = 200.0  
 
 CFG = AppConfig()
 
@@ -146,6 +157,16 @@ def ts_str_from_path(p: Path) -> Optional[str]:
         return None
     sec, nsec = ss
     return f"{sec}_{nsec}"
+
+def _build_ts_index(files: List[Path]) -> Dict[str, Path]:
+    """파일들의 TS 문자열(sec_nsec) → Path 매핑 딕셔너리"""
+    idx = {}
+    for p in files:
+        ts = ts_str_from_path(p)
+        if ts:
+            idx[ts] = p
+    return idx
+
 
 # =========================
 # 2) 보정 및 변환 유틸리티
@@ -332,7 +353,7 @@ def project_one_cam(cam_idx: int, img_idx: int, lidar_idx: int,
     
     lidar_path = lidar_files[lidar_idx]
     points = load_lidar_points(lidar_path)
-    points = filter_lidar_points(points, max_range=50.0)
+    points = filter_lidar_points(points, max_range=CFG.lidar_max_display_range_m)
     
     if len(points) == 0 or not draw_lidar:
         return img
@@ -360,9 +381,27 @@ def project_one_cam(cam_idx: int, img_idx: int, lidar_idx: int,
     
     # Color points by range
     ranges = np.linalg.norm(points_3d[:, :3], axis=1)
-    colors = plt.cm.jet(ranges / ranges.max() if ranges.max() > 0 else 0)[:, :3]
-    colors = (colors * 255).astype(np.uint8)
-    
+    # 1) 사용할 컬러맵 선택 (matplotlib 3.6+: mpl.colormaps)
+    try:
+        cmap = mpl.colormaps.get(CFG.lidar_cmap, mpl.colormaps["jet"])
+    except Exception:
+        # 구버전 대비 안전장치
+        cmap = getattr(plt.cm, CFG.lidar_cmap, plt.cm.jet)
+
+    # 2) 정규화 스케일 결정
+    if CFG.lidar_color_use_fixed_range:
+        rng_min = CFG.lidar_color_min_m
+        rng_max = CFG.lidar_color_max_m
+        denom = max(rng_max - rng_min, 1e-6)
+        norm = (ranges - rng_min) / denom
+    else:
+        rmax = float(ranges.max()) if ranges.size else 1.0
+        norm = ranges / max(rmax, 1e-6)
+
+    # 3) [0,1]로 클램프 후 색 변환
+    norm = np.clip(norm, 0.0, 1.0)
+    colors = (cmap(norm)[:, :3] * 255).astype(np.uint8)
+
     # Draw points
     for i, (pt, color) in enumerate(zip(points_2d, colors)):
         cv2.circle(img, (int(pt[0]), int(pt[1])), point_radius, 
@@ -497,6 +536,21 @@ def copy_file(src: Path, dst: Path):
             pass
     shutil.copy2(src, dst)
 
+def copy_dir(src: Path, dst: Path, log=None):
+    """src 디렉토리를 dst로 재귀 복사 (있으면 덮어씀)"""
+    if not src.exists():
+        if log: log(f"[warn] dir not found: {src}")
+        return
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)  # py>=3.8
+        if log: log(f"[info] copied dir: {src} -> {dst}")
+    except Exception as e:
+        if log: log(f"[error] copy dir failed: {src} -> {dst} ({e})")
+
+def _get_imu_csv_path(base_dir: Path) -> Optional[Path]:
+    p = base_dir / "imu" / "imu_data.csv"
+    return p if p.exists() else None
+
 def _infer_base_dir_from_marks(data: list) -> Optional[Path]:
     """
     marks_json 항목에 저장된 파일 경로(files.lidar / files.cams[0])로부터 base_dir 추정.
@@ -540,11 +594,16 @@ def _infer_base_dir_from_marks(data: list) -> Optional[Path]:
     return None
 
 def _list_inputs_from_base(base_dir: Path):
-    lidar_dir = base_dir / "lidar_xyzi"
+    lidar_xyzi_dir = base_dir / "lidar_xyzi"
+    lidar_raw_dir  = base_dir / "lidar"          # ← 추가
     cam_dirs  = [base_dir / "decoded_rgb" / f"camera_{i}" for i in range(1,7)]
-    lidar = sorted(lidar_dir.glob("*.bin"))
-    cams  = [sorted(d.glob("*.jpg")) for d in cam_dirs]
-    return lidar, cams
+
+    lidar_xyzi = sorted(lidar_xyzi_dir.glob("*.bin"))
+    lidar_raw  = sorted(lidar_raw_dir.glob("*.bin")) if lidar_raw_dir.exists() else []  # ← 추가
+    cams       = [sorted(d.glob("*.jpg")) for d in cam_dirs]
+
+    # 반환값을 (lidar_xyzi, cams, lidar_raw)로 확장
+    return lidar_xyzi, cams, lidar_raw
 
 def _pair_segments_from_marks(data: list):
     """
@@ -597,36 +656,160 @@ def _derive_root_name(base_dir: Path, dataset_tag: Optional[str]) -> str:
         return f"{base_name}_scenes"
 
 def export_scenes_from_marks(marks_json_path: Path,
-                             dataset_tag: Optional[str] = "SNU_mountain",
+                             dataset_tag: Optional[str] = "test",
                              log_cb=None,
+                             progress_cb: Optional[Callable[[int,int], None]] = None,
                              base_dir_override: Optional[Path] = None):
     """
     marks_json을 읽어 start/end 쌍 단위로 실제 파일을
     {OUT_ROOT}/{root_name}_{sid}/ 이하에 copy.
-    - symlink 미지원, 무조건 copy.
+      - lidar_xyzi  : sec_nsec 기반 이름으로 copy
+      - lidar (raw) : 같은 sec_nsec 매칭해 copy
+      - decoded_rgb : LiDAR TS prefix로 jpg copy
+      - radar1..3   : LiDAR TS에 가장 가까운 ts를 골라 copy
+      - camera_info, tf_static 디렉토리 통째로 copy
+      - 사용한 marks_json도 scene_dir/marks_json/ 에 함께 copy
+      - IMU (base_dir/imu/imu_data.csv): LiDAR start/end 사이 구간만 잘라 scene_dir/imu/imu.csv로 저장
+    진행률(progress_cb)은 프레임 단위로 호출.
     """
-    def log(msg):
-        if log_cb: log_cb(msg)
-        else: print(msg)
 
-    # 1) load marks
+    # ------------ 내부 유틸 (로그/IMU 로딩) ------------
+    def log(msg: str):
+        if log_cb:
+            log_cb(msg)
+        else:
+            print(msg)
+
+    def _get_imu_csv_path(base_dir: Path) -> Optional[Path]:
+        p = base_dir / "imu" / "imu_data.csv"
+        return p if p.exists() else None
+
+    def _load_imu_csv(imu_csv: Path) -> Tuple[List[str], np.ndarray, List[List[str]]]:
+        """
+        CSV를 읽어 (헤더, times(float sec), rows(list-of-str)) 반환.
+        지원 포맷(행당 timestamp 해석 우선순위):
+          1) 'sec' + 'nsec'
+          2) 'header.stamp.secs' + 'header.stamp.nsecs'
+          3) 'timestamp' 또는 'time' (float sec)
+          4) 첫 컬럼이 '123_456789000' 같은 'sec_nsec'
+        위가 없으면 시도 중 실패한 행은 스킵.
+        """
+        import csv, math, re
+
+        with imu_csv.open("r", newline="", encoding="utf-8") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel  # ★ 폴백
+            reader = csv.reader(f, dialect)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return [], np.array([], dtype=np.float64), []
+
+        # DictReader로 다시 읽기 (동일 dialect)
+        with imu_csv.open("r", newline="", encoding="utf-8") as f2:
+            reader = csv.DictReader(f2, fieldnames=header, dialect=dialect)
+            rows = []
+            times = []
+
+            # 어떤 키로 timestamp를 만들지 미리 결정
+            hdr = [h.strip() for h in header]
+
+            def parse_time(row: Dict[str, str]) -> Optional[float]:
+                # 1) sec/nsec
+                if "sec" in row and "nsec" in row:
+                    try:
+                        return float(int(row["sec"])) + float(int(row["nsec"])) * 1e-9
+                    except:
+                        pass
+
+                # 2) header.stamp.secs / header.stamp.nsecs
+                if ("header.stamp.secs" in row) and ("header.stamp.nsecs" in row):
+                    try:
+                        return float(int(row["header.stamp.secs"])) + float(int(row["header.stamp.nsecs"])) * 1e-9
+                    except:
+                        pass
+
+                # 3) timestamp or time (float sec)
+                for key in ("timestamp", "time"):
+                    if key in row:
+                        try:
+                            return float(row[key])
+                        except:
+                            pass
+
+                # 4) 첫 컬럼이 "1724141253_123456789" 형태
+                first_key = hdr[0] if hdr else None
+                if first_key and first_key in row:
+                    m = re.match(r"^\s*(\d+)\s*[_-]\s*(\d+)\s*$", str(row[first_key]))
+                    if m:
+                        try:
+                            return float(int(m.group(1))) + float(int(m.group(2))) * 1e-9
+                        except:
+                            pass
+
+                return None
+
+            # 실제 읽기
+            for i, row in enumerate(reader):
+                # DictReader는 헤더행도 한 번 나오므로 스킵
+                if i == 0 and list(row.values()) == header:
+                    continue
+                t = parse_time(row)
+                if t is None or not np.isfinite(t):
+                    # 파싱 실패한 행은 스킵
+                    continue
+                times.append(t)
+                # 원본 순서를 유지한 채 문자열 리스트로 저장
+                rows.append([row.get(h, "") for h in header])
+
+        if not rows:
+            return header, np.array([], dtype=np.float64), []
+
+        times_arr = np.asarray(times, dtype=np.float64)
+        # 혹시 시간 정렬 안되어 있으면 정렬
+        if not np.all(np.diff(times_arr) >= 0):
+            order = np.argsort(times_arr)
+            times_arr = times_arr[order]
+            rows = [rows[i] for i in order]
+
+        return header, times_arr, rows
+
+    # ------------ 1) marks 로드 ------------
     if not marks_json_path.exists():
         raise FileNotFoundError(f"Marks JSON not found: {marks_json_path}")
-    with open(marks_json_path, "r", encoding="utf-8") as f:
+    with marks_json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("Marks JSON must be a list of entries.")
 
-    # 2) base_dir 추정
+    # ------------ 2) base_dir 추정 ------------
     base_dir = base_dir_override if base_dir_override else _infer_base_dir_from_marks(data)
     if base_dir is None or not base_dir.exists():
         raise RuntimeError("Failed to infer base_dir from marks JSON. (files.lidar / files.cams 경로를 확인하세요)")
 
-    lidar_files, cam_files = _list_inputs_from_base(base_dir)
+    # lidar_xyzi, cams, lidar_raw
+    lidar_xyzi_files, cam_files, lidar_raw_files = _list_inputs_from_base(base_dir)
+    lidar_raw_by_ts = _build_ts_index(lidar_raw_files)
 
     # radar
     radar_files, radar_dirs = _list_radars_from_base(base_dir)
     radar_times = _precompute_radar_times(radar_files)
+
+    # IMU (규약 경로: base_dir/imu/imu_data.csv)
+    imu_header: List[str] = []
+    imu_times: np.ndarray = np.array([], dtype=np.float64)
+    imu_rows: List[List[str]] = []
+    imu_src = _get_imu_csv_path(base_dir)
+    if imu_src:
+        log(f"[info] IMU CSV     : {imu_src}")
+        imu_header, imu_times, imu_rows = _load_imu_csv(imu_src)
+        log(f"[info] IMU rows    : {len(imu_rows)} (times parsed)")
+    else:
+        log(f"[warn] IMU CSV not found at {base_dir / 'imu' / 'imu_data.csv'}")
 
     root_name = _derive_root_name(base_dir, dataset_tag)
     out_root = base_dir.parent / root_name
@@ -636,57 +819,78 @@ def export_scenes_from_marks(marks_json_path: Path,
     log(f"[info] Output root  : {out_root}")
     log(f"[info] Marks JSON   : {marks_json_path}")
     log(f"[info] Mode         : copy")
-
+    log(f"[info] LiDAR xyzi   : {len(lidar_xyzi_files)} files")
+    log(f"[info] LiDAR raw    : {len(lidar_raw_files)} files")
     for i, d in enumerate(radar_dirs, 1):
         log(f"[info] Radar{i} dir  : {d}  (files={len(radar_files[i-1])})")
 
-    # 3) pair start/end
-    pairs = _pair_segments_from_marks(data)
-    if not pairs:
+    # ------------ 3) start/end 페어 만들기 ------------
+    pairs_raw = _pair_segments_from_marks(data)
+    if not pairs_raw:
         log("[error] No start/end pairs found.")
         return
 
-    # 4) copy per pair
-    for sid, (l0, l1), (c0, c1), st, ed in pairs:
-        scene_dir = out_root / f"{root_name}_{sid}"
-        out_lidar = scene_dir / "lidar_xyzi"
-        out_cams  = [scene_dir / "decoded_rgb" / f"camera_{i}" for i in range(1,7)]
-        out_radars = [scene_dir / f"radar{i}" for i in range(1,4)]
-
-        ensure_dir(out_lidar)
-        for d in out_cams:
-            ensure_dir(d)
-        for d in out_radars:
-            ensure_dir(d)
-
-        # 범위
+    # 진행률 총 프레임 수
+    pair_infos = []
+    total_frames = 0
+    for sid, (l0, l1), (c0, c1), st, ed in pairs_raw:
         L_len = max(0, l1 - l0 + 1)
         C_len = [max(0, c1[i] - c0[i] + 1) for i in range(6)]
         seg_len = min([L_len] + C_len)
-        if seg_len <= 0:
-            log(f"[warn][scene {sid}] empty segment, skip.")
-            continue
-        if not (L_len == seg_len == C_len[0] == C_len[1] == C_len[2] == C_len[3] == C_len[4] == C_len[5]):
-            log(f"[warn][scene {sid}] length mismatch → truncate to {seg_len} "
-                f"(lidar={L_len}, cams={C_len})")
+        if seg_len > 0:
+            pair_infos.append((sid, (l0, l1), (c0, c1), seg_len, st, ed))
+            total_frames += seg_len
 
+    done_frames = 0
+    if progress_cb:
+        progress_cb(done_frames, total_frames)
+
+    # ------------ 4) 씬별 복사 ------------
+    for sid, (l0, l1), (c0, c1), seg_len, st, ed in pair_infos:
+        scene_dir = out_root / f"{root_name}_{sid}"
+        out_lidar_xyzi = scene_dir / "lidar_xyzi"
+        out_lidar_raw  = scene_dir / "lidar"
+        out_cams  = [scene_dir / "decoded_rgb" / f"camera_{i}" for i in range(1,7)]
+        out_radars = [scene_dir / f"radar{i}" for i in range(1,4)]
+
+        ensure_dir(out_lidar_xyzi)
+        ensure_dir(out_lidar_raw)
+        for d in out_cams: ensure_dir(d)
+        for d in out_radars: ensure_dir(d)
+
+        # 부가 폴더/파일 (씬마다)
+        copy_dir(base_dir / "camera_info", scene_dir / "camera_info", log)
+        copy_dir(base_dir / "tf_static",   scene_dir / "tf_static",   log)
+        dst_mj_dir = scene_dir / "marks_json"
+        ensure_dir(dst_mj_dir)
+        copy_file(marks_json_path, dst_mj_dir / marks_json_path.name)
+
+        # 프레임 단위 복사
         for k in range(seg_len):
-            lidar_src = lidar_files[l0 + k]
-            li_ts_str = ts_str_from_path(lidar_src) or _ts(lidar_src)  # 안전장치
+            lidar_src = lidar_xyzi_files[l0 + k]
+            li_ts_str = ts_str_from_path(lidar_src) or _ts(lidar_src)
             li_ts_val = ts_float_from_path(lidar_src)
 
-            # LiDAR
-            dst = out_lidar / f"{li_ts_str}_{k:06d}.bin"
-            copy_file(lidar_src, dst)
+            # LiDAR xyzi
+            dst_xyzi = out_lidar_xyzi / f"{li_ts_str}_{k:06d}.bin"
+            copy_file(lidar_src, dst_xyzi)
 
-            # Cams (라이다 접두 사용)
+            # LiDAR raw 매칭
+            raw_src = lidar_raw_by_ts.get(li_ts_str)
+            if raw_src is not None:
+                dst_raw = out_lidar_raw / f"{li_ts_str}_{k:06d}.bin"
+                copy_file(raw_src, dst_raw)
+            else:
+                log(f"[warn][scene {sid}] raw LiDAR not found for ts={li_ts_str}")
+
+            # Cams
             for i in range(6):
                 src_cam = cam_files[i][c0[i] + k]
                 dst_cam = out_cams[i] / f"{li_ts_str}_{k:06d}.jpg"
                 copy_file(src_cam, dst_cam)
 
-            # Radars (가장 가까운 타임스탬프 선택 후, 라이다 접두로 저장)
-            for r in range(3):  # radar1..3
+            # Radars (가까운 ts 골라서)
+            for r in range(3):
                 if not radar_files[r]:
                     continue
                 idx = _nearest_index(radar_times[r], li_ts_val)
@@ -696,6 +900,50 @@ def export_scenes_from_marks(marks_json_path: Path,
                 dst_radar = out_radars[r] / f"{li_ts_str}_{k:06d}.bin"
                 copy_file(src_radar, dst_radar)
 
+            done_frames += 1
+            if progress_cb:
+                progress_cb(done_frames, total_frames)
+
+        # ---- IMU 잘라 저장 (LiDAR start/end 구간) ----
+        try:
+            if imu_rows and imu_times.size > 0 and seg_len > 0:
+                t_start = ts_float_from_path(lidar_xyzi_files[l0])
+                t_end   = ts_float_from_path(lidar_xyzi_files[l0 + seg_len - 1])
+                if (t_start is not None) and (t_end is not None):
+                    # t_start <= t <= t_end 구간 선택 (근접 인덱스)
+                    def _nearest(a: np.ndarray, t: float) -> int:
+                        if a.size == 0: return 0
+                        i = np.searchsorted(a, t)
+                        cand = []
+                        if i > 0: cand.append(i-1)
+                        if i < a.size: cand.append(i)
+                        best = min(cand, key=lambda j: abs(a[j]-t)) if cand else 0
+                        return int(best)
+                    i0 = _nearest(imu_times, t_start)
+                    i1 = _nearest(imu_times, t_end)
+                    if i0 > i1: i0, i1 = i1, i0
+                    # 여유를 조금 두고 포함(선택)
+                    sel = imu_rows[i0:i1+1]
+
+                    imu_out_dir = scene_dir / "imu"
+                    ensure_dir(imu_out_dir)
+                    imu_out_csv = imu_out_dir / "imu.csv"
+                    # 쓰기
+                    import csv
+                    with imu_out_csv.open("w", newline="", encoding="utf-8") as fcsv:
+                        writer = csv.writer(fcsv)
+                        writer.writerow(imu_header if imu_header else [])
+                        for row in sel:
+                            writer.writerow(row)
+                    log(f"[ok][scene {sid}] IMU slice saved: {imu_out_csv} (rows={len(sel)})")
+                else:
+                    log(f"[warn][scene {sid}] IMU slice skipped (LiDAR timestamps missing)")
+            else:
+                log(f"[info][scene {sid}] IMU not available, skipped")
+        except Exception as e:
+            log(f"[warn][scene {sid}] IMU slice failed: {e}")
+
+        # scene_meta.json
         meta = {
             "scene_id": sid,
             "root_name": root_name,
@@ -708,12 +956,22 @@ def export_scenes_from_marks(marks_json_path: Path,
                 "radar1": len(radar_files[0]),
                 "radar2": len(radar_files[1]),
                 "radar3": len(radar_files[2]),
+            },
+            "imu": {
+                "source": str(imu_src) if imu_src else None,
+                "sliced": bool(imu_rows and imu_times.size > 0),
             }
         }
-        with open(scene_dir / "scene_meta.json", "w", encoding="utf-8") as f:
+        with (scene_dir / "scene_meta.json").open("w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
         log(f"[ok] {scene_dir}  (frames={seg_len})")
+
+    # 100% 보장
+    if progress_cb:
+        progress_cb(total_frames, total_frames)
+    log("[done] Export finished.")
+
 
 def create_timeline_matplotlib(current_lidar_idx, current_img_idx, control_mode,
                                snap_start, snap_end, segment_id, canvas_width, canvas_height):
@@ -1013,11 +1271,78 @@ class ImageLabel(QtWidgets.QLabel):
             self.clicked.emit(int(rx), int(ry))
         return super().mousePressEvent(ev)
 
+class ExportWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int)   # 0..100
+    log = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, marks_path: Path, dataset_tag="SNU_mountain", base_dir_override=None):
+        super().__init__()
+        self.marks_path = Path(marks_path)
+        self.dataset_tag = dataset_tag
+        self.base_dir_override = base_dir_override
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        def _log(msg: str):
+            self.log.emit(msg)
+        def _prog(done: int, total: int):
+            pct = int(done * 100 / max(1, total))
+            self.progress.emit(pct)
+        try:
+            export_scenes_from_marks(
+                self.marks_path,
+                dataset_tag=self.dataset_tag,
+                log_cb=_log,
+                progress_cb=_prog,             # ← 진행률 콜백 전달
+                base_dir_override=self.base_dir_override
+            )
+        except Exception as e:
+            self.log.emit(f"[error] {e}")
+        finally:
+            self.finished.emit()
+
+# def on_export_scenes(self):
+#     try:
+#         default_dir = str(((dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")).resolve())
+#         path, _ = QtWidgets.QFileDialog.getOpenFileName(
+#             self, "Select marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+#         )
+#         if not path:
+#             return
+
+#         self._log_export(f"[run] Export from: {path}")
+#         self.btn_export.setEnabled(False)
+#         self.prog.setValue(0)
+#         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+#         # 쓰레드 + 워커 구성
+#         self._exp_thread = QtCore.QThread(self)
+#         self._exp_worker = ExportWorker(Path(path), dataset_tag="SNU_mountain")
+#         self._exp_worker.moveToThread(self._exp_thread)
+#         self._exp_thread.started.connect(self._exp_worker.run)
+
+#         # 신호 연결
+#         self._exp_worker.log.connect(self._log_export)
+#         self._exp_worker.progress.connect(self.prog.setValue)
+#         self._exp_worker.finished.connect(self._exp_thread.quit)
+#         self._exp_worker.finished.connect(self._exp_worker.deleteLater)
+#         self._exp_thread.finished.connect(self._exp_thread.deleteLater)
+#         self._exp_thread.finished.connect(lambda: self.btn_export.setEnabled(True))
+#         self._exp_thread.finished.connect(lambda: QtWidgets.QApplication.restoreOverrideCursor())
+
+#         self._exp_thread.start()
+
+#     except Exception as e:
+#         self._log_export(f"[error] {e}")
+#         self.btn_export.setEnabled(True)
+#         QtWidgets.QApplication.restoreOverrideCursor()
+
 
 class Viewer(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SNU Mountain Dataset Viewer (PyQt6)")
+        self.setWindowTitle("Offroad Dataset Viewer (PyQt6)")
         self.resize(1500, 900)
 
         self._busy: bool = False            
@@ -1081,6 +1406,56 @@ class Viewer(QtWidgets.QMainWindow):
                 self._pending_action = None
                 QtCore.QTimer.singleShot(0, nxt)
 
+    def _start_export_dialog(self):
+        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        self._start_export(Path(path))
+
+    def _start_export(self, marks_path: Path, base_dir_override: Optional[Path] = None):
+        self._log_export(f"[run] Export from: {marks_path}")
+        self.btn_export.setEnabled(False)
+        self.prog.setValue(0)
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        # QThread + Worker
+        self._exp_thread = QtCore.QThread(self)
+        self._exp_worker = ExportWorker(
+            marks_path,
+            dataset_tag=CFG.dataset_tag,
+            base_dir_override=base_dir_override
+        )
+        self._exp_worker.moveToThread(self._exp_thread)
+        self._exp_thread.started.connect(self._exp_worker.run)
+
+        # signals
+        self._exp_worker.log.connect(self._log_export)
+        self._exp_worker.progress.connect(self.prog.setValue)
+        self._exp_worker.finished.connect(self._on_export_finished)
+
+        self._exp_thread.start()
+
+    def _on_export_finished(self):
+        try:
+            # 100% 보장(혹시 못 올렸을 경우)
+            self.prog.setValue(100)
+        except Exception:
+            pass
+        self.btn_export.setEnabled(True)
+        QtWidgets.QApplication.restoreOverrideCursor()
+        if hasattr(self, "_exp_worker"):
+            self._exp_worker.deleteLater()
+            del self._exp_worker
+        if hasattr(self, "_exp_thread"):
+            self._exp_thread.quit()
+            self._exp_thread.wait()
+            self._exp_thread.deleteLater()
+            del self._exp_thread
+
+
     # ========== UI 구성 ==========
     def _build_right_panel(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
@@ -1125,7 +1500,7 @@ class Viewer(QtWidgets.QMainWindow):
         h_step = QtWidgets.QHBoxLayout()
         h_step.addWidget(QtWidgets.QLabel("Step:"))
         self.cmb_step = QtWidgets.QComboBox()
-        self.cmb_step.addItems(["1", "5", "10"])
+        self.cmb_step.addItems(["1", "5", "10", "20", "50"])
         self.cmb_step.currentIndexChanged.connect(self.on_step_changed)
         h_step.addWidget(self.cmb_step)
         h_step.addStretch(1)
@@ -1213,7 +1588,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         # Export 버튼 + 로그창
         self.btn_export = QtWidgets.QPushButton("Export Scenes (copy)")
-        self.btn_export.clicked.connect(self.on_export_scenes)
+        self.btn_export.clicked.connect(self._start_export_dialog)
         v.addWidget(self.btn_export)
 
         self.txt_export = QtWidgets.QTextEdit()
@@ -1225,6 +1600,10 @@ class Viewer(QtWidgets.QMainWindow):
         self.btn_export_latest.clicked.connect(self.on_export_latest)
         v.addWidget(self.btn_export_latest)
 
+        self.prog = QProgressBar()
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+        v.addWidget(self.prog)
 
         v.addStretch(1)
         return w
@@ -1591,7 +1970,7 @@ class Viewer(QtWidgets.QMainWindow):
             if not mj.exists():
                 self._log_export(f"[error] {mj} not found")
                 return
-            # 🔁 패턴을 *_syn_marks_*.json 으로 변경
+            # 패턴을 *_syn_marks_*.json 으로 변경
             candidates = sorted(mj.glob("*_syn_marks_*.json"))
             if not candidates:
                 self._log_export("[error] no *_syn_marks_*.json")
@@ -1600,8 +1979,7 @@ class Viewer(QtWidgets.QMainWindow):
             self._log_export(f"[run] Export from latest: {chosen}")
             self.btn_export_latest.setEnabled(False)
             QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            export_scenes_from_marks(chosen, dataset_tag="SNU_mountain", log_cb=self._log_export)
-            self._log_export("[done] Export finished.")
+            self._start_export(chosen)
         except Exception as e:
             self._log_export(f"[error] {e}")
         finally:
