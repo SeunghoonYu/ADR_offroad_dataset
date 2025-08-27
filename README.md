@@ -8,11 +8,15 @@
 <img src="assets/offroad_vis_test2.png" width="1000">
 
 ## Directory example
+```text
 <data_root>/
-└── Gwangmyeong_Hagon_0822_15_22_scenes/
-    └── Gwangmyeong_Hagon_0822_15_22_scenes_<ID>/
-        ├── camera_info/
-        ├── decoded_rgb/
+└── /test0804_11_11/                    # original data
+    └── ...
+    └── ...    
+└── <Location>_0804_11_11_scenes/       # original data to matching scenes
+    └── <Location>_0804_11_11_scenes_1/
+        ├── camera_info/                    # Calibration matrix info
+        ├── decoded_rgb/                    # RGB images
         │   ├── camera_1/
         │   ├── camera_2/
         │   ├── camera_3/
@@ -20,13 +24,16 @@
         │   ├── camera_5/
         │   └── camera_6/
         ├── imu/
-        │   └── imu.csv                 # 선택 구간만, index 0부터 재부여
-        ├── lidar/                      # raw lidar (sec_nsec 매칭)
-        ├── lidar_xyzi/                 # xyzi 포맷 (sec_nsec_######.bin)
-        ├── marks_json/                 # 사용한 마크 파일 백업
-        ├── radar1/
+        │   └── imu.csv                     # clip by lidar timestamps
+        ├── lidar/                          # raw lidar (for rosbag) 
+        ├── lidar_xyzi/                     # xyzi only
+        ├── marks_json/                     # sync matching index 
+        ├── radar1/                         # clip by lidar timestamps
         ├── radar2/
         ├── radar3/
-        ├── tf_static/
+        ├── tf_static/                      # base_link tf
         │   └── tf_static.json
         └── scene_meta.json
+    └── <Location>_0804_11_11_scenes_2/
+    └── <Location>_0804_11_11_scenes_3/
+    └── <Location>_0804_11_11_scenes_4/
