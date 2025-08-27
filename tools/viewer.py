@@ -55,7 +55,7 @@ class AppConfig:
     tile_w: int = 640
     tile_h: int = 480
     timeline_h: int = 300
-    start_index_default: int = 50
+    start_index_default: int = 500
 
     # --- LiDAR 표시/색상 ---
     lidar_cmap: str = "turbo_r"              # 예: "turbo", "viridis", "plasma", "jet", ...
@@ -593,6 +593,32 @@ def _infer_base_dir_from_marks(data: list) -> Optional[Path]:
 
     return None
 
+def _inject_reindex(header: List[str], rows: List[List[str]], colname: str = "index"):
+    """
+    header에 colname이 있으면 그 컬럼 값을 0..N-1로 덮어쓰기,
+    없으면 맨 앞에 새 컬럼으로 추가.
+    header가 비어 있으면(비정상 케이스) 원본을 그대로 반환.
+    """
+    if not header:
+        return header, rows  # fallback
+
+    header_out = header[:]
+    if colname in header_out:
+        j = header_out.index(colname)
+        out_rows = []
+        for i, r in enumerate(rows):
+            rr = r[:]
+            if j >= len(rr):
+                rr += [""] * (j - len(rr) + 1)
+            rr[j] = str(i)
+            out_rows.append(rr)
+        return header_out, out_rows
+    else:
+        header_out = [colname] + header_out
+        out_rows = [[str(i)] + r for i, r in enumerate(rows)]
+        return header_out, out_rows
+
+
 def _list_inputs_from_base(base_dir: Path):
     lidar_xyzi_dir = base_dir / "lidar_xyzi"
     lidar_raw_dir  = base_dir / "lidar"          # ← 추가
@@ -928,14 +954,16 @@ def export_scenes_from_marks(marks_json_path: Path,
                     imu_out_dir = scene_dir / "imu"
                     ensure_dir(imu_out_dir)
                     imu_out_csv = imu_out_dir / "imu.csv"
-                    # 쓰기
-                    import csv
+                    
+                    hdr_out, rows_out = _inject_reindex(imu_header, sel, colname="index")
+
                     with imu_out_csv.open("w", newline="", encoding="utf-8") as fcsv:
                         writer = csv.writer(fcsv)
-                        writer.writerow(imu_header if imu_header else [])
-                        for row in sel:
-                            writer.writerow(row)
-                    log(f"[ok][scene {sid}] IMU slice saved: {imu_out_csv} (rows={len(sel)})")
+                        if hdr_out:
+                            writer.writerow(hdr_out)
+                        writer.writerows(rows_out)
+
+                    log(f"[ok][scene {sid}] IMU slice saved: {imu_out_csv} (rows={len(rows_out)}) [reindexed]")
                 else:
                     log(f"[warn][scene {sid}] IMU slice skipped (LiDAR timestamps missing)")
             else:
@@ -1370,8 +1398,8 @@ class Viewer(QtWidgets.QMainWindow):
         self.individual_step: int = 1
 
         # 시작 인덱스 설정
-        self.img_idx = [50] * self.num_cams
-        self.lidar_idx = 50
+        self.img_idx = [CFG.start_index_default] * self.num_cams
+        self.lidar_idx = CFG.start_index_default
 
         # ---- 중앙 이미지 ----
         self.view = ImageLabel()
