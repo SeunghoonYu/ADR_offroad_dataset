@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import QProgressBar
 from dataclasses import dataclass
 from typing import Callable
 import csv
+from functools import lru_cache
 
 # =========================
 # 0) CONFIG (한 곳에서 수정)
@@ -55,20 +56,42 @@ class AppConfig:
     tile_w: int = 640
     tile_h: int = 480
     timeline_h: int = 300
-    start_index_default: int = 500
+    start_index_default: int = 700
 
     # --- LiDAR 표시/색상 ---
     lidar_cmap: str = "turbo_r"              # 예: "turbo", "viridis", "plasma", "jet", ...
     lidar_color_use_fixed_range: bool = True
     lidar_color_min_m: float = 0.0         
     lidar_color_max_m: float = 50.0        
-    lidar_max_display_range_m: float = 200.0  
+    lidar_max_display_range_m: float = 150.0  
 
 CFG = AppConfig()
 
 # =========================
 # 1) 데이터 로딩 및 설정
 # =========================
+
+# ① 디코딩 캐시: 파일 이름(혹은 절대경로) 기준
+@lru_cache(maxsize=64)
+def _load_lidar_points_once(fname: str) -> np.ndarray:
+    p = Path(fname)
+    pts = np.fromfile(p, dtype=np.float32).reshape(-1, 4)
+    return pts
+
+def load_lidar_points_cached(lidar_path: Path) -> np.ndarray:
+    return _load_lidar_points_once(str(lidar_path))
+
+# ② 범위 필터도 키에 포함 (max_range 바뀌면 다른 결과)
+@lru_cache(maxsize=128)
+def _filter_by_range(fname: str, max_range: float) -> np.ndarray:
+    pts = load_lidar_points_cached(Path(fname))
+    if pts.size == 0: 
+        return pts
+    rng = np.linalg.norm(pts[:, :3], axis=1)
+    return pts[rng <= max_range]
+
+def get_lidar_points(lidar_path: Path, max_range: float) -> np.ndarray:
+    return _filter_by_range(str(lidar_path), float(max_range))
 
 def load_scene_meta():
     """Load scene metadata from scene_meta.json"""
@@ -143,6 +166,16 @@ def _extract_sec_nsec(p: Path) -> Optional[Tuple[int, int]]:
     if len(nums) >= 2:
         return nums[-2], nums[-1]
     return None
+
+def _paint_points_fast(img: np.ndarray, xy: np.ndarray, colors: np.ndarray):
+    # 경계 체크(안전)
+    H, W = img.shape[:2]
+    if xy.size == 0: 
+        return img
+    iu = np.clip(xy[:,0], 0, W-1)
+    iv = np.clip(xy[:,1], 0, H-1)
+    img[iv, iu] = colors  # 벡터화 대입
+    return img
 
 def ts_float_from_path(p: Path) -> Optional[float]:
     ss = _extract_sec_nsec(p)
@@ -323,6 +356,10 @@ def project_lidar_to_camera(points_3d: np.ndarray, K: np.ndarray, R: np.ndarray,
     points_2d = K @ points_cam.T
     points_2d = points_2d[:2] / points_2d[2]
     points_2d = points_2d.T
+
+    valid_mask = np.isfinite(points_2d).all(axis=1)
+    points_2d = points_2d[valid_mask]
+    points_3d = points_3d[valid_mask]
     
     # Filter points within image bounds
     mask = ((points_2d[:, 0] >= 0) & (points_2d[:, 0] < img_w) & 
@@ -330,90 +367,162 @@ def project_lidar_to_camera(points_3d: np.ndarray, K: np.ndarray, R: np.ndarray,
     
     return points_2d[mask], points_3d[mask]
 
-def project_one_cam(cam_idx: int, img_idx: int, lidar_idx: int, 
-                   draw_lidar: bool = True, point_radius: int = 2) -> np.ndarray:
-    """Project LiDAR points to one camera image"""
+# (lidar_file, cam_idx, color_range_key, point_radius_key) -> (xy_int[N,2], colors[N,3], z[N])
+_projection_cache: dict[tuple, tuple] = {}
+
+def _color_lut_256(name: str = None):
+    """
+    name: CFG.lidar_cmap 값을 넣어라. 예) "turbo", "turbo_r", "jet", "jet_r"
+    반환: (256,3) BGR uint8 LUT
+    """
+    key = f"__lut__{name or 'default'}"
+    if not hasattr(_color_lut_256, key):
+        # 0~255 컬럼 벡터
+        lut_img = np.arange(0, 256, dtype=np.uint8)[:, None]
+
+        # 기본 colormap 결정 (OpenCV가 지원하는 범위 우선)
+        base = (name or "turbo").lower()
+        reversed_flag = base.endswith("_r")
+        base = base[:-2] if reversed_flag else base  # "_r" 제거
+
+        # OpenCV 지원 맵 매핑
+        cv_map = {
+            "turbo": getattr(cv2, "COLORMAP_TURBO", None),
+            "jet": cv2.COLORMAP_JET,
+            # 필요 시 추가 가능
+        }.get(base, None)
+
+        if cv_map is not None:
+            lut_bgr = cv2.applyColorMap(lut_img, cv_map)
+            if reversed_flag:
+                lut_bgr = lut_bgr[::-1]  # ← 여기서 바로 뒤집기(= turbo_r)
+            lut = lut_bgr.reshape(256, 3).astype(np.uint8)
+        else:
+            # OpenCV에 해당 맵이 없으면 matplotlib로 폴백
+            import matplotlib.pyplot as plt
+            try:
+                cmap = mpl.colormaps.get(name or "turbo")
+            except Exception:
+                cmap = getattr(plt.cm, (name or "turbo"), plt.cm.jet)
+            lut_rgb = (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+            lut = lut_rgb[:, ::-1]  # RGB→BGR
+
+        setattr(_color_lut_256, key, lut)
+
+    return getattr(_color_lut_256, key)
+
+def _project_and_color(points_xyz_i: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray,
+                       img_w: int, img_h: int,
+                       vmin: float, vmax: float):
+    """points_xyz_i: float32 [N,4], returns (xy_int, colors_bgr, z)"""
+    # 1) world->cam
+    X = points_xyz_i[:, :3].astype(np.float32, copy=False)
+    # R (3x3), t (3,) 모두 float32
+    Rc = R.astype(np.float32, copy=False)
+    tc = t.astype(np.float32, copy=False)
+
+    Xc = (X @ Rc.T) + tc  # [N,3]
+    Z = Xc[:, 2]
+    front = Z > 0.0
+    if not np.any(front):
+        return np.empty((0,2), np.int32), np.empty((0,3), np.uint8), Z
+
+    Xc = Xc[front]; Z = Z[front]
+
+    # 2) cam->pix (직접 수식이 K@ 나누기보다 더 빠름)
+    fx, fy = K[0,0], K[1,1]
+    cx, cy = K[0,2], K[1,2]
+    u = (Xc[:,0] * fx) / Z + cx
+    v = (Xc[:,1] * fy) / Z + cy
+
+    # 3) in-bounds
+    iu = u.astype(np.int32); iv = v.astype(np.int32)
+    inb = (iu >= 0) & (iu < img_w) & (iv >= 0) & (iv < img_h)
+    if not np.any(inb):
+        return np.empty((0,2), np.int32), np.empty((0,3), np.uint8), Z
+
+    iu = iu[inb]; iv = iv[inb]
+    xy = np.stack([iu, iv], axis=1)
+
+    # 4) 색상 (고정 범위 정규화 → LUT 인덱스)
+    rng = np.linalg.norm(X[front][inb], axis=1)
+    if vmax <= vmin: vmax = vmin + 1e-3
+    norm = (rng - vmin) / (vmax - vmin)
+    norm = np.clip(norm, 0.0, 1.0)
+    idx = (norm * 255.0).astype(np.uint8)
+    lut = _color_lut_256(CFG.lidar_cmap)
+    colors = lut[idx]  # [N,3] BGR uint8
+    return xy, colors, Z[inb]
+
+def get_projection(lidar_path: Path, cam_idx: int, calib: dict, vmin: float, vmax: float, point_radius: int):
+    key = (lidar_path.name, cam_idx, int(vmin*10), int(vmax*10), point_radius)
+    if key in _projection_cache:
+        return _projection_cache[key]
+
+    # 준비
+    points = get_lidar_points(lidar_path, CFG.lidar_max_display_range_m)
+    if points.size == 0:
+        _projection_cache[key] = (np.empty((0,2), np.int32), np.empty((0,3), np.uint8))
+        return _projection_cache[key]
+
+    K = calib['K'].astype(np.float32, copy=False)
+    R = calib['R_cam_lidar'].astype(np.float32, copy=False)
+    t = calib['t_cam_lidar'].astype(np.float32, copy=False)
+    img_w, img_h = int(calib['img_w']), int(calib['img_h'])
+
+    xy, colors, _ = _project_and_color(points, K, R, t, img_w, img_h, vmin, vmax)
+    _projection_cache[key] = (xy, colors)
+    return _projection_cache[key]
+
+
+def project_one_cam(cam_idx, img_idx, lidar_idx, draw_lidar=True, point_radius=2):
     global camera_files, lidar_files, calib_data
-    
-    # Load camera image
-    if cam_idx >= len(camera_files) or img_idx >= len(camera_files[cam_idx]):
-        return np.zeros((480, 640, 3), dtype=np.uint8)
-    
+    # 1) 이미지 로드
+    if cam_idx >= len(camera_files) or img_idx >= len(camera_files[cam_idx]): 
+        return np.zeros((480,640,3), np.uint8)
     img_path = camera_files[cam_idx][img_idx]
-    if not img_path.exists():
-        return np.zeros((480, 640, 3), dtype=np.uint8)
-    
     img = cv2.imread(str(img_path))
-    if img is None:
-        return np.zeros((480, 640, 3), dtype=np.uint8)
-    
-    # Load LiDAR data
-    if lidar_idx >= len(lidar_files):
+    if img is None: 
+        return np.zeros((480,640,3), np.uint8)
+
+    # 2) 빠른 복귀
+    if not draw_lidar or lidar_idx >= len(lidar_files):
         return img
-    
+
     lidar_path = lidar_files[lidar_idx]
-    points = load_lidar_points(lidar_path)
-    points = filter_lidar_points(points, max_range=CFG.lidar_max_display_range_m)
-    
-    if len(points) == 0 or not draw_lidar:
-        return img
-    
-    # Use calibration if available
+
+    # 3) 캘리브레이션 준비 (float32)
     if calib_data and cam_idx < len(calib_data):
         calib = calib_data[cam_idx]
-        K = calib['K']
-        R = calib['R_cam_lidar']
-        t = calib['t_cam_lidar']
-        img_w, img_h = calib['img_w'], calib['img_h']
     else:
-        # Default calibration (approximate) - adjusted for better projection
-        img_w, img_h = img.shape[1], img.shape[0]
-        K = np.array([[1000, 0, img_w//2], [0, 1000, img_h//2], [0, 0, 1]], dtype=np.float64)
-        R = np.eye(3, dtype=np.float64)
-        # Move camera back to see LiDAR points in front
-        t = np.array([0, 0, 5], dtype=np.float64)
-    
-    # Project points
-    points_2d, points_3d = project_lidar_to_camera(points, K, R, t, img_w, img_h)
-    
-    if len(points_2d) == 0:
-        return img
-    
-    # Color points by range
-    ranges = np.linalg.norm(points_3d[:, :3], axis=1)
-    # 1) 사용할 컬러맵 선택 (matplotlib 3.6+: mpl.colormaps)
-    try:
-        cmap = mpl.colormaps.get(CFG.lidar_cmap, mpl.colormaps["jet"])
-    except Exception:
-        # 구버전 대비 안전장치
-        cmap = getattr(plt.cm, CFG.lidar_cmap, plt.cm.jet)
+        h, w = img.shape[:2]
+        calib = {'K': np.array([[1000,0,w//2],[0,1000,h//2],[0,0,1]], np.float32),
+                 'R_cam_lidar': np.eye(3, np.float32),
+                 't_cam_lidar': np.array([0,0,5], np.float32),
+                 'img_w': w, 'img_h': h}
 
-    # 2) 정규화 스케일 결정
-    if CFG.lidar_color_use_fixed_range:
-        rng_min = CFG.lidar_color_min_m
-        rng_max = CFG.lidar_color_max_m
-        denom = max(rng_max - rng_min, 1e-6)
-        norm = (ranges - rng_min) / denom
-    else:
-        rmax = float(ranges.max()) if ranges.size else 1.0
-        norm = ranges / max(rmax, 1e-6)
+    # 4) 프로젝션 캐시 사용
+    xy, colors = get_projection(
+        lidar_path=lidar_path,
+        cam_idx=cam_idx,
+        calib=calib,
+        vmin=CFG.lidar_color_min_m, vmax=CFG.lidar_color_max_m,
+        point_radius=point_radius
+    )
 
-    # 3) [0,1]로 클램프 후 색 변환
-    norm = np.clip(norm, 0.0, 1.0)
-    colors = (cmap(norm)[:, :3] * 255).astype(np.uint8)
+    # 5) FAST/Pretty draw
+    if xy.shape[0] > 0:
+        if point_radius <= 1:
+            _paint_points_fast(img, xy, colors)
+        else:
+            step = 1 if xy.shape[0] < 80000 else 2
+            for i in range(0, xy.shape[0], step):
+                cv2.circle(img, (int(xy[i,0]), int(xy[i,1])), point_radius, colors[i].tolist(), -1, cv2.LINE_AA)
 
-    # Draw points
-    for i, (pt, color) in enumerate(zip(points_2d, colors)):
-        cv2.circle(img, (int(pt[0]), int(pt[1])), point_radius, 
-                  (int(color[2]), int(color[1]), int(color[0])), -1)
-    
-    # Add timestamp label
-    if img_path.exists():
-        timestamp_str = _ts(img_path)
-        cv2.putText(img, f"Cam{cam_idx+1} {timestamp_str}", (20, 50), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120, 255, 0), 2)
-    
+    # 6) 라벨
+    cv2.putText(img, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
     return img
+
 
 def build_canvas(imgs: List[np.ndarray]) -> np.ndarray:
     """Build a 2x3 grid canvas with order: top=2,1,6 / bottom=5,4,3"""
@@ -1383,8 +1492,11 @@ class Viewer(QtWidgets.QMainWindow):
         self.project_lidar: bool = False
         self.point_radius: int = 2
         self.step_size: int = 1
-        self.allowed_next: str = "start"  # "start" -> "end" 토글
-        self.segment_id: int = 1
+        self.allowed_next: str = initial_allowed_next  # "start"/"end"
+        self.segment_id: int = int(initial_segment_id)
+        self.current_phase: str = None
+        self.snap_start: Dict[str, Any] = copy.deepcopy(initial_snap_start) if initial_snap_start else None
+        self.snap_end: Dict[str, Any] = copy.deepcopy(initial_snap_end) if initial_snap_end else None
         self.undo_stack: List[Dict[str, Any]] = []  # 최근 저장(s/e) 스냅샷 버퍼(되돌리기용 1단계 이상도 가능)
         self.cached_canvas: np.ndarray | None = None
 
@@ -1483,6 +1595,90 @@ class Viewer(QtWidgets.QMainWindow):
             self._exp_thread.deleteLater()
             del self._exp_thread
 
+    def _resume_from_dialog(self):
+        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select marks JSON to resume",
+            default_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        p = Path(path)
+        if not p.exists():
+            self._toast(f"File not found: {p}")
+            return
+
+        # JSON 로드
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if not isinstance(data, list):
+                    self._toast("Invalid marks format (not a list).")
+                    return
+        except Exception as e:
+            self._toast(f"Failed to read JSON: {e}")
+            return
+
+        # base_dir 추정 및 데이터셋 스위치(필요 시)
+        inferred = _infer_base_dir_from_marks(data)
+        if inferred and (str(inferred) != str(dataset_base_dir)):
+            self._toast(f"Switch dataset to: {inferred}")
+            self._reload_dataset(inferred)
+
+        # append 타겟 변경
+        global marks_json_path
+        marks_json_path = p
+
+        # 상태 복구
+        allowed, segid, sstart, send = _resume_state_from_marks(p)
+        self.allowed_next = allowed
+        self.segment_id = int(segid)
+        self.snap_start = copy.deepcopy(sstart) if sstart else None
+        self.snap_end = copy.deepcopy(send) if send else None
+
+        # 보기 인덱스도 스냅샷 근처로 맞춤
+        # - 다음에 저장해야 할 대상(allowed_next)에 따라 기준 스냅샷을 선택
+        ref_snap = self.snap_start if (self.allowed_next == "end" and self.snap_start) else self.snap_end
+        if ref_snap:
+            # LiDAR
+            lidx = int(ref_snap.get("lidar_idx", self.lidar_idx))
+            self.lidar_idx = int(np.clip(lidx, 0, max(0, len(lidar_files)-1)))
+            # 카메라들
+            cam_indices = ref_snap.get("cam_indices", self.img_idx)
+            if isinstance(cam_indices, list) and len(cam_indices) == 6:
+                new_cam_idx = []
+                for i in range(6):
+                    max_i = max(0, len(camera_files[i]) - 1)
+                    new_cam_idx.append(int(np.clip(int(cam_indices[i]), 0, max_i)))
+                self.img_idx = new_cam_idx
+
+        # UI 동기화
+        self.sld.blockSignals(True)
+        self.sld.setValue(self.lidar_idx)
+        self.sld.setMaximum(max(0, len(lidar_files) - 1))
+        self.sld.blockSignals(False)
+
+        self._toast(f"Resumed: allowed_next={self.allowed_next}, segment_id={self.segment_id}")
+        self._refresh_state_label()
+        self._refresh()
+
+
+    def _reload_dataset(self, new_base_dir: Path):
+        """marks JSON으로부터 추정된 base_dir로 데이터셋을 갈아끼움."""
+        global camera_files, lidar_files, dataset_base_dir
+
+        dataset_base_dir = new_base_dir
+        camera_files, lidar_files, _ = load_camera_and_lidar_files()
+
+        # 슬라이더 범위/인덱스 초기화
+        self.sld.blockSignals(True)
+        self.sld.setMaximum(max(0, len(lidar_files) - 1))
+        self.sld.blockSignals(False)
+
+        # 기본 인덱스
+        self.img_idx = [min(CFG.start_index_default, max(0, len(c)-1)) for c in camera_files]
+        self.lidar_idx = min(CFG.start_index_default, max(0, len(lidar_files)-1))
 
     # ========== UI 구성 ==========
     def _build_right_panel(self) -> QtWidgets.QWidget:
@@ -1490,6 +1686,11 @@ class Viewer(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(10, 10, 10, 10)
         v.setSpacing(8)
+
+        # json 불러오기
+        self.btn_resume = QtWidgets.QPushButton("Resume from marks JSON…")
+        self.btn_resume.clicked.connect(self._resume_from_dialog)
+        v.addWidget(self.btn_resume)
 
         # 1) Frame Navigation 헤더
         title = QtWidgets.QLabel("<b>Frame Navigation</b>")
@@ -2025,24 +2226,83 @@ camera_files: List[List[Path]] = []
 lidar_files: List[Path] = []
 calib_data = None
 marks_json_path: Path = None
-dataset_base_dir: Optional[Path] = None  # ← 이미 선언돼 있으면 그대로 두세요
+dataset_base_dir: Optional[Path] = None
+
+initial_allowed_next: str = "start"
+initial_segment_id: int = 1
+initial_snap_start: Optional[Dict[str, Any]] = None
+initial_snap_end: Optional[Dict[str, Any]] = None
+
+def _resume_state_from_marks(marks_path: Path) -> Tuple[str, int, Optional[dict], Optional[dict]]:
+    """
+    기존 marks JSON을 읽어서 다음 저장 상태(allowed_next), 다음 세그먼트 번호(segment_id),
+    가장 최근 START/END 스냅샷을 유추한다.
+    규칙:
+      - 라벨 'startN' 뒤에 'endN'이 없으면 => allowed_next='end', segment_id=N
+      - 가장 큰 N의 'endN'이 존재하면 => allowed_next='start', segment_id=N+1
+    """
+    if (not marks_path) or (not marks_path.exists()):
+        return "start", 1, None, None
+
+    with open(marks_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+            if not isinstance(data, list):
+                return "start", 1, None, None
+        except Exception:
+            return "start", 1, None, None
+
+    # N 추출
+    starts = {}
+    ends = {}
+    last_start = None
+    last_end = None
+    for it in data:
+        label = str(it.get("label", ""))
+        m = re.match(r"^(start|end)(\d+)$", label)
+        if not m:
+            continue
+        kind, n = m.group(1), int(m.group(2))
+        if kind == "start":
+            starts[n] = it
+            last_start = it
+        else:
+            ends[n] = it
+            last_end = it
+
+    if not starts and not ends:
+        return "start", 1, None, None
+
+    max_n = max(starts.keys() | ends.keys())
+    # 케이스 1) 마지막 startN 이 있고 endN 이 없음 => end가 다음
+    if (max_n in starts) and (max_n not in ends):
+        return "end", max_n, starts.get(max_n), last_end
+    # 케이스 2) 마지막 endN 까지 완료 => 다음은 start, segment_id = max_n + 1
+    return "start", max_n + 1, last_start, last_end
+
+
+def _find_latest_marks(marks_dir: Path, base_name: str) -> Optional[Path]:
+    """marks_dir에서 base_name 접두의 *_syn_marks_*.json 중 가장 최신을 고른다."""
+    if not marks_dir.exists():
+        return None
+    candidates = sorted(marks_dir.glob(f"{base_name}_syn_marks_*.json"))
+    return candidates[-1] if candidates else None
+
 
 def initialize_data():
-    """Initialize all data structures"""
     global camera_files, lidar_files, calib_data, marks_json_path, dataset_base_dir
+    global initial_allowed_next, initial_segment_id, initial_snap_start, initial_snap_end
 
     print("Loading scene metadata...")
     scene_meta = load_scene_meta()
 
     print("Loading camera and LiDAR files...")
-    
     camera_files, lidar_files, dataset_base_dir = load_camera_and_lidar_files()
     print(f"Base dir: {dataset_base_dir}")
     print(f"Found {len(lidar_files)} LiDAR files")
     for i, cam_files_i in enumerate(camera_files):
         print(f"Camera {i+1}: {len(cam_files_i)} files")
 
-    # Calibration
     calib_path = Path("./calib_matrix/matrix0801.yaml")
     if calib_path.exists():
         print(f"Loading calibration data from {calib_path}...")
@@ -2051,39 +2311,38 @@ def initialize_data():
         print("No calibration file found, using default parameters")
         calib_data = None
 
-    
     marks_dir = (dataset_base_dir / "marks_json") if (dataset_base_dir and dataset_base_dir.exists()) else Path("./marks_json")
     marks_dir.mkdir(parents=True, exist_ok=True)
-
     run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
-    
     marks_json_path = marks_dir / f"{base_name}_syn_marks_{run_ts}.json"
-
     print(f"Marks will be saved to: {marks_json_path}")
+
+    # 새 세션이므로 초기 상태는 항상 start/1
+    initial_allowed_next, initial_segment_id = "start", 1
+    initial_snap_start, initial_snap_end = None, None
+
 
 # =========================
 # 9) 메인 함수
 # =========================
 
 def main():
-    # Initialize data
+    # Initialize data (항상 새 파일 생성)
     initialize_data()
-    
-    # Check if we have data
+
     if len(lidar_files) == 0:
         print("Error: No LiDAR files found!")
         return
-    
     if all(len(cam_files) == 0 for cam_files in camera_files):
         print("Error: No camera files found!")
         return
-    
-    # Start Qt application
+
     app = QtWidgets.QApplication(sys.argv)
     win = Viewer()
     win.show()
     sys.exit(app.exec())
+
 
 
 if __name__ == "__main__":
