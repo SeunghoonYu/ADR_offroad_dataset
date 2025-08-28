@@ -478,7 +478,7 @@ def create_lidar_overview_bar(
                 _put_label(img, str(a), (xa - 6, top_y_green - 6), fs_small, c2, th_small)
                 _put_label(img, str(b), (xb - 6, top_y_green - 6), fs_small, c2, th_small)
             else:
-                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10), top_y_green - 6, fs_small, c2, th_small)
+                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, top_y_green - 6), fs_small, c2, th_small)
 
     if merged_segs:
         bottom_y_red = rail_y + 22
@@ -2328,33 +2328,87 @@ class Viewer(QtWidgets.QMainWindow):
 
     def on_make_merged_json(self):
         try:
-            # 1) 카메라 marks 선택 (기본: 현재 marks_json_path)
-            default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
-            cam_path = marks_json_path if marks_json_path else None
-            if not cam_path or (not cam_path.exists()):
-                path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    self, "Select camera marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
-                )
-                if not path:
-                    return
-                cam_path = Path(path)
+            if not marks_json_path or (not Path(marks_json_path).exists()):
+                self._toast("카메라 marks JSON이 로드되지 않았습니다.")
+                return
+            if not self.gps_allow_segs:
+                self._toast("GNSS JSON(허용 구간)을 먼저 로드해주세요.")
+                return
 
-            # 2) GNSS '불가' JSON 선택
-            gpath, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Select GNSS-bad JSON (start/end are '불가' 구간)", default_dir, "JSON Files (*.json);;All Files (*)"
-            )
-            gps_bad = Path(gpath) if gpath else None
+            # 1) 원본 카메라 세그먼트+카메라 시작 인덱스 로드
+            with open(marks_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pairs = _pair_segments_from_marks(data)  # (sid, (l0,l1), (c0,c1), st, ed)
 
-            # 3) 생성
-            out_path, merged = write_merged_marks_json(cam_path, gps_bad, out_path=None)
-            self._log_export(f"[ok] merged marks saved: {out_path} (segments={len(merged)})")
+            N = len(lidar_files)
+            if N <= 0:
+                self._toast("LiDAR 파일이 없습니다.")
+                return
 
-            # 4) 뷰에 빨강 반영 (선택사항: 여기선 즉시 반영)
-            self.merged_segs = merged
+            # 2) 교집합(빨간) 계산: (카메라 세그들의 합집합) ∩ (GNSS 허용)
+            cam_segs = []
+            # cam 세그먼트는 병합해서 전체 카메라 허용으로
+            for sid, (l0, l1), (c0, c1), st, ed in pairs:
+                a, b = int(l0), int(l1)
+                if a > b: a, b = b, a
+                cam_segs.append((a, b))
+            cam_segs = _merge_segments(cam_segs, N)
+            inter = _intersect_segments(cam_segs, self.gps_allow_segs)  # ★ 교집합
+
+            if not inter:
+                self._toast("교집합 구간이 없습니다.")
+                self.merged_segs = []
+                self._refresh()
+                return
+
+            # 3) 교집합을 '원본 세그먼트 쌍' 기준으로 쪼개서 start/end 스냅샷 생성
+            out_list = []
+            new_sid = 1
+
+            # 원본 페어별로 교집합과 겹치는 부분만 분할
+            for _sid, (l0, l1), (c0, c1), _st, _ed in pairs:
+                a0, a1 = int(l0), int(l1)
+                if a0 > a1: a0, a1 = a1, a0
+                # 이 원본 세그와 inter의 교집합
+                parts = _intersect_segments([(a0,a1)], inter)
+                for (s, e) in parts:
+                    if s > e: 
+                        continue
+                    # cam 인덱스는 시작 cam에서 offset 만큼 전진
+                    off_s = s - a0
+                    off_e = e - a0
+                    cam_s = []
+                    cam_e = []
+                    for i in range(6):
+                        max_i = max(0, len(camera_files[i]) - 1)
+                        cs = int(np.clip(int(c0[i]) + off_s, 0, max_i))
+                        ce = int(np.clip(int(c0[i]) + off_e, 0, max_i))
+                        cam_s.append(cs)
+                        cam_e.append(ce)
+
+                    # 새 start/end 스냅샷
+                    snapS = _build_snapshot(f"start{new_sid}", s, cam_s)
+                    snapE = _build_snapshot(f"end{new_sid}",   e, cam_e)
+                    out_list.append(snapS); out_list.append(snapE)
+                    new_sid += 1
+
+            # 4) 파일로 저장
+            run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            worker = _sanitize_token(getattr(CFG, "worker_name", "anon"))
+            base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
+            out_path = (marks_json_path.parent /
+                        f"merged_{base_name}_{run_ts}_{worker}.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(out_list, f, ensure_ascii=False, indent=2)
+
+            # 5) 뷰에 빨간(교집합) ㄷ자 적용
+            self.merged_segs = inter
+            self._toast(f"Merged JSON saved: {out_path.name}  (segments={new_sid-1})")
             self._refresh()
-            self._toast("Merged JSON created.")
+
         except Exception as e:
-            self._toast(f"Make merged JSON failed: {e}")
+            self._toast(f"Merge failed: {e}")
+
 
 
     def _reload_dataset(self, new_base_dir: Path):
@@ -2941,50 +2995,43 @@ initial_snap_end: Optional[Dict[str, Any]] = None
 
 def _resume_state_from_marks(marks_path: Path) -> Tuple[str, int, Optional[dict], Optional[dict]]:
     """
-    기존 marks JSON을 읽어서 다음 저장 상태(allowed_next), 다음 세그먼트 번호(segment_id),
+    기존 marks JSON을 읽어 다음 저장 상태(allowed_next), 다음 세그먼트 번호(segment_id),
     가장 최근 START/END 스냅샷을 유추한다.
-    규칙:
-      - 라벨 'startN' 뒤에 'endN'이 없으면 => allowed_next='end', segment_id=N
-      - 가장 큰 N의 'endN'이 존재하면 => allowed_next='start', segment_id=N+1
     """
     if (not marks_path) or (not marks_path.exists()):
         return "start", 1, None, None
 
-    with open(marks_path, "r", encoding="utf-8") as f:
-        try:
+    try:
+        with marks_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-            if not isinstance(data, list):
-                return "start", 1, None, None
-        except Exception:
-            return "start", 1, None, None
+    except Exception:
+        return "start", 1, None, None
 
-    # N 추출
-    starts = {}
-    ends = {}
-    last_start = None
-    last_end = None
+    if not isinstance(data, list) or not data:
+        return "start", 1, None, None
+
+    starts, ends = {}, {}
     for it in data:
-        label = str(it.get("label", ""))
-        m = re.match(r"^(start|end)(\d+)$", label)
+        lab = str(it.get("label", ""))
+        m = re.match(r"^(start|end)(\d+)$", lab)
         if not m:
             continue
-        kind, n = m.group(1), int(m.group(2))
+        kind, sid = m.group(1), int(m.group(2))
         if kind == "start":
-            starts[n] = it
-            last_start = it
+            starts[sid] = it
         else:
-            ends[n] = it
-            last_end = it
+            ends[sid] = it
 
     if not starts and not ends:
         return "start", 1, None, None
 
-    max_n = max(starts.keys() | ends.keys())
-    # 케이스 1) 마지막 startN 이 있고 endN 이 없음 => end가 다음
-    if (max_n in starts) and (max_n not in ends):
-        return "end", max_n, starts.get(max_n), last_end
-    # 케이스 2) 마지막 endN 까지 완료 => 다음은 start, segment_id = max_n + 1
-    return "start", max_n + 1, last_start, last_end
+    last_sid = max(set(starts.keys()) | set(ends.keys()))
+    # case 1) 마지막 sid가 start만 있고 end가 없으면 → 다음은 end 저장
+    if (last_sid in starts) and (last_sid not in ends):
+        return "end", last_sid, starts.get(last_sid), ends.get(last_sid - 1)
+    # case 2) 마지막 sid에 end까지 있으면 → 다음은 start 저장
+    return "start", last_sid + 1, starts.get(last_sid), ends.get(last_sid)
+
 
 
 def _find_latest_marks(marks_dir: Path, base_name: str) -> Optional[Path]:
