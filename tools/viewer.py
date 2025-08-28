@@ -35,6 +35,11 @@ from functools import lru_cache
 # =========================
 @dataclass
 class AppConfig:
+    # Indexing MArks filename config
+    # {sensor}_{origin_data_folder_name}_{postprocessing_time}_{worker_name}.json
+    filename_prefix: str = "camera"
+    worker_name: str = "TonyStark"
+
     # 데이터셋 루트 (읽기/marks_json 저장의 기준)
     base_dir: Path = Path("/mnt/e/off-road/data_0822/test0822_15_22")
 
@@ -56,20 +61,35 @@ class AppConfig:
     tile_w: int = 640
     tile_h: int = 480
     timeline_h: int = 300
-    start_index_default: int = 700
+    overview_h: int = 120
+    overview_base_color: tuple = (180, 120, 60)   # BGR (파란 베이스)
+    overview_seg_color: tuple = (0, 160, 255)     # BGR (주황 박스)
+    overview_gps_allow_color: tuple = (30, 180, 60)  # 초록(= GPS 불가의 여집합, 사용 가능)
+    overview_gps_post_thick: int = 4                 # 초록 기둥/상단 두께
+    overview_base_thick: int = 12                 # 베이스 라인 두께
+    overview_post_thick: int = 6                  # 세그먼트 기둥/상단 두께
+    overview_min_pix: int = 6                     # 세그민트 최소 픽셀 폭
+    start_index_default: int = 100
 
     # --- LiDAR 표시/색상 ---
     lidar_cmap: str = "turbo_r"              # 예: "turbo", "viridis", "plasma", "jet", ...
     lidar_color_use_fixed_range: bool = True
-    lidar_color_min_m: float = 0.0         
+    lidar_color_min_m: float = 2.0         
     lidar_color_max_m: float = 50.0        
     lidar_max_display_range_m: float = 150.0  
+
+    
 
 CFG = AppConfig()
 
 # =========================
 # 1) 데이터 로딩 및 설정
 # =========================
+
+def _sanitize_token(s: str) -> str:
+    """파일명 안전 토큰: 소문자/숫자/언더스코어만 남기고 비우면 'anon'."""
+    return re.sub(r'[^a-z0-9_]+', '', (s or '').strip().lower()) or 'anon'
+
 
 # ① 디코딩 캐시: 파일 이름(혹은 절대경로) 기준
 @lru_cache(maxsize=64)
@@ -149,7 +169,149 @@ def _ts(p):
         return "_".join(stem[-2:])
     else:  # LiDAR 파일
         return "_".join([stem[-2], stem[-1].replace('xyzi', '')])
-    
+
+import json, re
+
+def _merge_ranges(ranges: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
+    if not ranges: return []
+    a = sorted((min(s,e), max(s,e)) for s,e in ranges)
+    out = [a[0]]
+    for s,e in a[1:]:
+        ps,pe = out[-1]
+        if s <= pe + 1:   # 인접/겹침 병합
+            out[-1] = (ps, max(pe, e))
+        else:
+            out.append((s,e))
+    return out
+
+def _complement_ranges(blocks: List[Tuple[int,int]], lo: int, hi: int) -> List[Tuple[int,int]]:
+    """[lo,hi]에서 blocks를 뺀 여집합"""
+    if lo > hi: return []
+    blocks = _merge_ranges([(max(lo,a), min(hi,b)) for a,b in blocks if b>=lo and a<=hi])
+    res = []
+    cur = lo
+    for a,b in blocks:
+        if cur < a: res.append((cur, a-1))
+        cur = max(cur, b+1)
+    if cur <= hi: res.append((cur, hi))
+    return res
+
+def _read_gps_bad_ranges(json_path: Path) -> List[Tuple[int,int]]:
+    """GNSS JSON에서 startN/endN 페어를 (a,b) 리스트로 추출"""
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    starts, ends = {}, {}
+    for it in data:
+        label = str(it.get("label",""))
+        m = re.match(r"^(start|end)(\d+)$", label)
+        if not m: continue
+        kind, n = m.group(1), int(m.group(2))
+        li = int(it.get("lidar_idx", 0))
+        if kind == "start": starts[n] = li
+        else: ends[n] = li
+    pairs = []
+    for n in sorted(set(starts) & set(ends)):
+        a, b = int(starts[n]), int(ends[n])
+        if a > b: a, b = b, a
+        pairs.append((a,b))
+    merged =  _merge_ranges(pairs)
+    print(f"[GNSS:read] file={json_path.name} pairs={len(pairs)} merged={len(merged)}")
+    if pairs:  print(f"[GNSS:read] pairs_sample={pairs[:8]}")
+    if merged: print(f"[GNSS:read] merged_sample={merged[:8]}")
+
+    return merged
+
+
+def _extract_lidar_segments_from_marks(marks_path: Path) -> list[tuple[int, int]]:
+    """
+    현재 marks JSON에서 (startN, endN) 페어를 (l0, l1) 리스트로 추출.
+    l0 <= l1 로 정렬, 오름차순 정렬 후 반환.
+    """
+    if not marks_path or (not marks_path.exists()):
+        return []
+    try:
+        with marks_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        pairs = _pair_segments_from_marks(data)  # (sid, (l0,l1), (c0,c1), st, ed)
+        segs = []
+        for sid, (l0, l1), (_c0, _c1), _st, _ed in pairs:
+            a, b = int(l0), int(l1)
+            if a > b:
+                a, b = b, a
+            segs.append((a, b))
+        segs.sort()
+        return segs
+    except Exception:
+        return []
+
+def _intersect_segments(a: list[tuple[int,int]], b: list[tuple[int,int]], N: int) -> list[tuple[int,int]]:
+    """
+    [0..N-1] 범위에서 두 세그먼트 집합의 교집합을 반환.
+    각 세그먼트는 포함구간 [s,e].
+    """
+    A = _merge_segments(a, N)   # 이미 있는 함수 재사용
+    B = _merge_segments(b, N)
+    i = j = 0
+    out = []
+    while i < len(A) and j < len(B):
+        s = max(A[i][0], B[j][0])
+        e = min(A[i][1], B[j][1])
+        if s <= e:
+            out.append((s, e))
+        if A[i][1] < B[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
+def _merge_segments(segs: list[tuple[int,int]], N: int) -> list[tuple[int,int]]:
+    """[l0,l1] 포함 구간들을 [0..N-1]에 클램프하고 겹침/인접을 병합."""
+    if N <= 0 or not segs: 
+        return []
+    norm = []
+    for a,b in segs:
+        a,b = int(a), int(b)
+        if a > b: a,b = b,a
+        a = max(0, min(N-1, a))
+        b = max(0, min(N-1, b))
+        if a <= b:
+            norm.append((a,b))
+    if not norm: 
+        return []
+    norm.sort()
+    merged = [norm[0]]
+    for a,b in norm[1:]:
+        pa,pb = merged[-1]
+        if a <= pb + 1:               # 겹치거나 바로 닿으면 병합
+            merged[-1] = (pa, max(pb, b))
+        else:
+            merged.append((a,b))
+    return merged
+
+def _segments_complement(forbid: list[tuple[int,int]], N: int) -> list[tuple[int,int]]:
+    """[0..N-1]에서 forbid(불가, 포함구간)의 여집합(사용 가능)을 반환."""
+    if N <= 0: 
+        return []
+    merged = _merge_segments(forbid, N)
+    if not merged:
+        return [(0, N-1)]
+    allow = []
+    cur = 0
+    for a,b in merged:
+        if cur <= a-1:
+            allow.append((cur, a-1))  # 표준적으로 양끝 제외(겹치기 싫으면 -1 사용)
+        cur = b + 1
+    if cur <= N-1:
+        allow.append((cur, N-1))
+    return allow
+
+def _load_gps_bad_segments(gps_path: Path, total_lidar: int) -> list[tuple[int,int]]:
+    """GPS팀 JSON에서 LiDAR 인덱스 구간을 읽어 불가구간(병합 후)으로 반환."""
+    segs = _extract_lidar_segments_from_marks(gps_path)  # startN/endN 포맷 재사용
+    return _merge_segments(segs, total_lidar)
+
+
 def _extract_sec_nsec(p: Path) -> Optional[Tuple[int, int]]:
     """
     파일명(stem)에서 끝의 숫자 2개를 (sec, nsec)으로 인식.
@@ -200,6 +362,150 @@ def _build_ts_index(files: List[Path]) -> Dict[str, Path]:
             idx[ts] = p
     return idx
 
+def create_lidar_overview_bar(
+    total_lidar: int,
+    current_lidar_idx: int,
+    segs: List[Tuple[int,int]],
+    width: int,
+    height: int,
+    extra_segs: Optional[List[Tuple[int,int]]] = None,   # GNSS 허용 구간
+    extra_color: Tuple[int,int,int] = (60, 200, 60),     # BGR (초록)
+    merged_segs: Optional[List[Tuple[int,int]]] = None, # [ADD] 빨간(교집합)
+    merged_color: Tuple[int,int,int] = (0, 0, 255),     # [ADD]
+    *,
+    font_shrink: float = 0.3,       # 글씨를 얼마나 줄일지 (1.0=기존, 0.85=조금 작게)
+    green_raise_px: int = 30,        # 초록 ㄷ자 바의 높이를 얼마나 더 올릴지(+픽셀)
+    green_post_th_add: int = 2       # 초록 ㄷ자 기둥/상단 두께를 얼마나 더 두껍게
+) -> np.ndarray:
+    """
+    화살표 베이스(파란색) + 세그먼트 ㄷ자(주황색) + extra_segs ㄷ자(초록색) 오버뷰 바.
+    초록 ㄷ자는 더 높고(=더 위쪽) 약간 더 두껍게, 글씨는 살짝 작게.
+    """
+
+    def _put_label(img, text, org, fs, color, thick=1, pad=3):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, thick)
+        x, y = int(org[0]), int(org[1])
+        # 경계 안으로 클램프
+        x = max(0, min(img.shape[1] - tw - 2, x))
+        y = max(th + 2, min(img.shape[0] - 2, y))
+        # 흰 배경 + 옅은 테두리로 가독성 확보
+        cv2.rectangle(img, (x - pad, y - th - pad - 1), (x + tw + pad, y + pad), (255, 255, 255), -1)
+        cv2.rectangle(img, (x - pad, y - th - pad - 1), (x + tw + pad, y + pad), (220, 220, 220), 1)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, color, thick, cv2.LINE_AA)
+
+    # 크기 & 폰트 스케일
+    width = max(480, int(width))
+    height = max(60, int(height))
+    base_scale = height / 120.0
+    fs_main  = max(0.6, 0.9 * base_scale * font_shrink)
+    fs_small = max(0.5, 0.8 * base_scale * font_shrink)
+    th_main  = max(1, int(round(2 * base_scale)))
+    th_small = max(1, int(round(2 * base_scale)))
+
+    
+
+    img = np.full((height, width, 3), 255, np.uint8)
+    red_drop = 40
+    pad_l, pad_r = 24, 36
+    pad_t, pad_b = 10, 8
+    rail_y = height - pad_b - CFG.overview_base_thick // 2 - red_drop
+    x0, x1 = pad_l, width - pad_r
+
+    base_c = CFG.overview_base_color
+    cv2.line(img, (x0, rail_y), (x1, rail_y), base_c, CFG.overview_base_thick, cv2.LINE_AA)
+    head_w, head_h = 16, 12
+    pts = np.array([[x1, rail_y], [x1 + head_w, rail_y], [x1, rail_y - head_h]], np.int32)
+    cv2.fillConvexPoly(img, pts, base_c)
+
+    if total_lidar <= 1:
+        return img
+
+    def ix_to_x(i: int) -> int:
+        i = int(np.clip(i, 0, total_lidar - 1))
+        return x0 + int((i / (total_lidar - 1)) * (x1 - x0))
+
+    seg_c   = CFG.overview_seg_color
+    post_th = CFG.overview_post_thick
+    top_y_orange = rail_y - 22              # 주황 ㄷ자의 상단 y
+    top_y_green  = top_y_orange - green_raise_px  # 초록 ㄷ자는 더 위로(=더 높게)
+    min_px  = CFG.overview_min_pix
+
+    def _draw_cap(xa, xb, y_top, color, thick):
+        cv2.line(img, (xa, rail_y), (xa, y_top), color, thick, cv2.LINE_AA)
+        cv2.line(img, (xb, rail_y), (xb, y_top), color, thick, cv2.LINE_AA)
+        cv2.line(img, (xa, y_top), (xb, y_top), color, thick, cv2.LINE_AA)
+
+    # ── 주황(내 JSON) 구간들 + 라벨 ──
+    for a, b in (segs or []):
+        if a > b: a, b = b, a
+        xa, xb = ix_to_x(a), ix_to_x(b)
+        if xb - xa < min_px:
+            mid = (xa + xb) // 2
+            xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
+            xa = max(x0, xa); xb = min(x1, xb)
+
+        # ㄷ자
+        cv2.line(img, (xa, rail_y), (xa, top_y_orange), seg_c, post_th, cv2.LINE_AA)
+        cv2.line(img, (xb, rail_y), (xb, top_y_orange), seg_c, post_th, cv2.LINE_AA)
+        cv2.line(img, (xa, top_y_orange), (xb, top_y_orange), seg_c, post_th, cv2.LINE_AA)
+
+        # 라벨
+        if (xb - xa) >= (min_px + 12):
+            _put_label(img, str(a), (xa - 6, top_y_orange - 6), fs_small, seg_c, th_small)
+            _put_label(img, str(b), (xb - 6, top_y_orange - 6), fs_small, seg_c, th_small)
+        else:
+            _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, top_y_orange - 6), fs_small, seg_c, th_small)
+
+    # ── 초록(GNSS 허용) 구간들 + 라벨 ──
+    if extra_segs:
+        c2 = extra_color
+        post_th_green = post_th + int(green_post_th_add)
+        for a, b in extra_segs:
+            if a > b: a, b = b, a
+            xa, xb = ix_to_x(a), ix_to_x(b)
+            if xb - xa < min_px:
+                mid = (xa + xb) // 2
+                xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
+                xa = max(x0, xa); xb = min(x1, xb)
+
+            # 초록 ㄷ자 (더 높고, 더 두껍게)
+            cv2.line(img, (xa, rail_y), (xa, top_y_green), c2, post_th_green, cv2.LINE_AA)
+            cv2.line(img, (xb, rail_y), (xb, top_y_green), c2, post_th_green, cv2.LINE_AA)
+            cv2.line(img, (xa, top_y_green), (xb, top_y_green), c2, post_th_green, cv2.LINE_AA)
+
+            # 라벨 위치도 초록 상단 기준
+            if (xb - xa) >= (min_px + 12):
+                _put_label(img, str(a), (xa - 6, top_y_green - 6), fs_small, c2, th_small)
+                _put_label(img, str(b), (xb - 6, top_y_green - 6), fs_small, c2, th_small)
+            else:
+                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10), top_y_green - 6, fs_small, c2, th_small)
+
+    if merged_segs:
+        bottom_y_red = rail_y + 22
+        for a, b in merged_segs:
+            if a > b: a, b = b, a
+            xa, xb = ix_to_x(a), ix_to_x(b)
+            if xb - xa < min_px:
+                mid = (xa+xb)//2
+                xa, xb = mid - min_px//2, mid + int(np.ceil(min_px/2))
+                xa = max(x0, xa); xb = min(x1, xb)
+            # 아래쪽으로 기둥/캡
+            cv2.line(img, (xa, rail_y), (xa, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
+            cv2.line(img, (xb, rail_y), (xb, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
+            cv2.line(img, (xa, bottom_y_red), (xb, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
+
+    # 현재 인덱스 / 양끝
+    cx = ix_to_x(current_lidar_idx)
+    cv2.line(img, (cx, rail_y - 26), (cx, rail_y + 8), (0, 0, 255), 2, cv2.LINE_AA)
+    _put_label(img, str(current_lidar_idx),
+               (min(max(cx - 12, x0), x1 - 24), rail_y - 30), fs_small, (0, 0, 170), th_small)
+
+    _put_label(img, "0", (x0 - 6, rail_y + 24), fs_small, (90, 90, 90), th_small)
+    _put_label(img, f"{total_lidar - 1}", (x1 - 40, rail_y + 24), fs_small, (90, 90, 90), th_small)
+
+    return img
+
+
 
 # =========================
 # 2) 보정 및 변환 유틸리티
@@ -228,14 +534,9 @@ def make_T_parent_child(translation, ypr):
 # =========================
 
 def load_calib_yaml(yaml_path: Path):
-    """Load camera calibration from YAML file"""
-    if not yaml_path.exists():
-        print(f"Warning: {yaml_path} not found, using default calibration")
-        return None
-    
     with open(yaml_path, 'r') as f:
         cfg = yaml.safe_load(f)
-    
+
     img_w = int(cfg['image']['width'])
     img_h = int(cfg['image']['height'])
     alpha = float(cfg.get('undistort', {}).get('alpha', 0.0))
@@ -243,26 +544,57 @@ def load_calib_yaml(yaml_path: Path):
 
     cams = []
     for cam in cfg['cameras']:
-        Trc_cam = make_T_parent_child(cam['rotcam_extrinsic']['translation'], 
-                                    cam['rotcam_extrinsic']['rotation_ypr'])
+        # === extrinsic: cam <- lidar ===
+        Trc_cam = make_T_parent_child(cam['rotcam_extrinsic']['translation'],
+                                      cam['rotcam_extrinsic']['rotation_ypr'])
         L = cam['lidar_extrinsic']
         Trc_lidar = make_T_parent_child(L['translation'], L['rotation_ypr'])
 
         T_cam_rotcam = np.linalg.inv(Trc_cam)
-        T_cam_lidar = T_cam_rotcam @ Trc_lidar
-        R_cam_lidar = T_cam_lidar[:3,:3].copy()
-        t_cam_lidar = T_cam_lidar[:3, 3].copy()
+        T_cam_lidar  = T_cam_rotcam @ Trc_lidar
+        R_cam_lidar  = T_cam_lidar[:3,:3].copy()
+        t_cam_lidar  = T_cam_lidar[:3, 3].copy()
 
-        # Camera intrinsic - use intrinsics field
-        K = np.array(cam['intrinsics']['K'], dtype=np.float64).reshape(3,3)
-        D = np.array(cam['distortion']['coeffs'], dtype=np.float64).ravel()
-        
-        cams.append({
-            'K': K, 'D': D, 'R_cam_lidar': R_cam_lidar, 't_cam_lidar': t_cam_lidar,
-            'img_w': img_w, 'img_h': img_h, 'alpha': alpha, 'proj_mode': proj_mode
-        })
-    
-    return cams
+        cam_dict = {
+            'name': cam['name'],
+            'R_cam_lidar': R_cam_lidar,
+            't_cam_lidar': t_cam_lidar,
+            'img_w': img_w, 'img_h': img_h,
+            'alpha': alpha,
+            'proj_mode': proj_mode,
+        }
+
+        # === rectification path 선택 ===
+        if 'ros_caminfo' in cam and cam['ros_caminfo']:
+            rc = _rectify_maps_from_ros_caminfo(cam['ros_caminfo'])
+            cam_dict.update({
+                'rect_model': 'ros',
+                'map1': rc['map1'], 'map2': rc['map2'],
+                'P_rect': rc['P_rect'],          # (3,4)
+                'K_rect': rc['K_rect'],          # (3,3)
+                'out_size': rc['out_size'],      # (w,h)
+            })
+        else:
+            # OpenCV 경로 (K_new)
+            K    = np.array(cam['intrinsics']['K'], dtype=np.float64)
+            dist = np.array(cam['distortion']['coeffs'], dtype=np.float64).reshape(1,-1)
+            K_new, roi = cv2.getOptimalNewCameraMatrix(K, dist, (img_w,img_h), alpha, (img_w,img_h))
+            map1, map2 = cv2.initUndistortRectifyMap(
+                cameraMatrix=K, distCoeffs=dist, R=None,
+                newCameraMatrix=K_new, size=(img_w,img_h), m1type=cv2.CV_16SC2
+            )
+            cam_dict.update({
+                'rect_model': 'opencv',
+                'K': K, 'D': dist,
+                'K_new': K_new, 'roi': tuple(int(v) for v in roi),  # (x,y,w,h)
+                'map1': map1, 'map2': map2,
+                'out_size': (img_w, img_h),
+            })
+
+        cams.append(cam_dict)
+
+    return cams  # ← 리스트로 반환(기존 calib_data 사용처와 호환)
+
 
 def _rectify_maps_from_ros_caminfo(caminfo):
     """Generate rectification maps from ROS camera info"""
@@ -312,6 +644,46 @@ def _rectify_maps_from_ros_caminfo(caminfo):
 # =========================
 # 4) LiDAR 데이터 처리
 # =========================
+
+def _merge_and_clip_segments(segs: list[tuple[int,int]], total_n: int) -> list[tuple[int,int]]:
+    """구간들을 [0, total_n-1]로 클램프하고, 겹치거나 인접(바로 붙은) 구간을 병합."""
+    if total_n <= 0:
+        return []
+    last = total_n - 1
+    norm = []
+    for a, b in segs:
+        a = max(0, min(last, int(a)))
+        b = max(0, min(last, int(b)))
+        if a > b: a, b = b, a
+        norm.append((a, b))
+    norm.sort()
+
+    merged = []
+    for a, b in norm:
+        if not merged or a > merged[-1][1] + 1:
+            merged.append([a, b])
+        else:
+            merged[-1][1] = max(merged[-1][1], b)
+    return [(a, b) for a, b in merged]
+
+def _complement_segments(bad: list[tuple[int,int]], total_n: int) -> list[tuple[int,int]]:
+    """[0..N-1]에서 bad의 여집합(= allow)을 반환."""
+    if total_n <= 0:
+        return []
+    bad = _merge_and_clip_segments(bad, total_n)
+    allow = []
+    cur = 0
+    last = total_n - 1
+    for a, b in bad:
+        if cur <= a - 1:
+            allow.append((cur, a - 1))
+        cur = b + 1
+        if cur > last:
+            break
+    if cur <= last:
+        allow.append((cur, last))
+    return allow
+
 
 def load_lidar_points(lidar_path: Path) -> np.ndarray:
     """Load LiDAR points from binary file (KITTI format: x,y,z,intensity)"""
@@ -371,45 +743,43 @@ def project_lidar_to_camera(points_3d: np.ndarray, K: np.ndarray, R: np.ndarray,
 _projection_cache: dict[tuple, tuple] = {}
 
 def _color_lut_256(name: str = None):
-    """
-    name: CFG.lidar_cmap 값을 넣어라. 예) "turbo", "turbo_r", "jet", "jet_r"
-    반환: (256,3) BGR uint8 LUT
-    """
     key = f"__lut__{name or 'default'}"
     if not hasattr(_color_lut_256, key):
-        # 0~255 컬럼 벡터
-        lut_img = np.arange(0, 256, dtype=np.uint8)[:, None]
+        lut_img = np.arange(256, dtype=np.uint8)[:, None]
 
-        # 기본 colormap 결정 (OpenCV가 지원하는 범위 우선)
-        base = (name or "turbo").lower()
-        reversed_flag = base.endswith("_r")
-        base = base[:-2] if reversed_flag else base  # "_r" 제거
+        cmap_name = (name or "turbo").lower()
+        reversed_flag = cmap_name.endswith("_r")
+        base = cmap_name[:-2] if reversed_flag else cmap_name
 
-        # OpenCV 지원 맵 매핑
         cv_map = {
             "turbo": getattr(cv2, "COLORMAP_TURBO", None),
             "jet": cv2.COLORMAP_JET,
-            # 필요 시 추가 가능
         }.get(base, None)
 
         if cv_map is not None:
             lut_bgr = cv2.applyColorMap(lut_img, cv_map)
             if reversed_flag:
-                lut_bgr = lut_bgr[::-1]  # ← 여기서 바로 뒤집기(= turbo_r)
+                lut_bgr = lut_bgr[::-1]
             lut = lut_bgr.reshape(256, 3).astype(np.uint8)
         else:
-            # OpenCV에 해당 맵이 없으면 matplotlib로 폴백
-            import matplotlib.pyplot as plt
+            # Matplotlib fallback
             try:
-                cmap = mpl.colormaps.get(name or "turbo")
+                cmap = mpl.colormaps.get(cmap_name)  # "turbo_r" 등 지원 시 바로 OK
             except Exception:
-                cmap = getattr(plt.cm, (name or "turbo"), plt.cm.jet)
+                cmap = None
+
+            if cmap is None:
+                # base만 시도하고, 필요하면 수동 reverse
+                base_cmap = getattr(plt.cm, base, plt.cm.jet)
+                cmap = base_cmap.reversed() if reversed_flag and hasattr(base_cmap, "reversed") else base_cmap
+
             lut_rgb = (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
-            lut = lut_rgb[:, ::-1]  # RGB→BGR
+            lut = lut_rgb[:, ::-1]  # RGB->BGR
 
         setattr(_color_lut_256, key, lut)
 
     return getattr(_color_lut_256, key)
+
 
 def _project_and_color(points_xyz_i: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray,
                        img_w: int, img_h: int,
@@ -475,53 +845,132 @@ def get_projection(lidar_path: Path, cam_idx: int, calib: dict, vmin: float, vma
     return _projection_cache[key]
 
 
-def project_one_cam(cam_idx, img_idx, lidar_idx, draw_lidar=True, point_radius=2):
+def project_one_cam(cam_idx: int, img_idx: int, lidar_idx: int, 
+                   draw_lidar: bool = True, point_radius: int = 2) -> np.ndarray:
     global camera_files, lidar_files, calib_data
+
     # 1) 이미지 로드
-    if cam_idx >= len(camera_files) or img_idx >= len(camera_files[cam_idx]): 
-        return np.zeros((480,640,3), np.uint8)
+    if cam_idx >= len(camera_files) or img_idx >= len(camera_files[cam_idx]):
+        return np.zeros((480, 640, 3), dtype=np.uint8)
     img_path = camera_files[cam_idx][img_idx]
-    img = cv2.imread(str(img_path))
-    if img is None: 
-        return np.zeros((480,640,3), np.uint8)
+    img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    # 2) 빠른 복귀
-    if not draw_lidar or lidar_idx >= len(lidar_files):
-        return img
+    # 2) (항상) 보정(remap)하여 표시용 이미지 만들기
+    use_ros = False
+    alpha = 0.0
+    mode = 'undistorted'
+    img_disp = img_bgr
+    R = np.eye(3, dtype=np.float64)
+    t = np.zeros(3, np.float64)
 
-    lidar_path = lidar_files[lidar_idx]
-
-    # 3) 캘리브레이션 준비 (float32)
     if calib_data and cam_idx < len(calib_data):
-        calib = calib_data[cam_idx]
-    else:
-        h, w = img.shape[:2]
-        calib = {'K': np.array([[1000,0,w//2],[0,1000,h//2],[0,0,1]], np.float32),
-                 'R_cam_lidar': np.eye(3, np.float32),
-                 't_cam_lidar': np.array([0,0,5], np.float32),
-                 'img_w': w, 'img_h': h}
+        c = calib_data[cam_idx]
+        R = c['R_cam_lidar'].astype(np.float64)
+        t = c['t_cam_lidar'].astype(np.float64)
+        alpha = float(c.get('alpha', 0.0))
+        use_ros = (c.get('rect_model','opencv') == 'ros')
+        mode = c.get('proj_mode','undistorted')
 
-    # 4) 프로젝션 캐시 사용
-    xy, colors = get_projection(
-        lidar_path=lidar_path,
-        cam_idx=cam_idx,
-        calib=calib,
-        vmin=CFG.lidar_color_min_m, vmax=CFG.lidar_color_max_m,
-        point_radius=point_radius
-    )
-
-    # 5) FAST/Pretty draw
-    if xy.shape[0] > 0:
-        if point_radius <= 1:
-            _paint_points_fast(img, xy, colors)
+        und = cv2.remap(img_bgr, c['map1'], c['map2'], interpolation=cv2.INTER_LINEAR)
+        # OpenCV 경로에서 alpha==0이면 ROI 크롭
+        if (not use_ros) and alpha == 0.0:
+            x, y, w, h = c['roi']
+            img_disp = und[y:y+h, x:x+w].copy()
         else:
-            step = 1 if xy.shape[0] < 80000 else 2
-            for i in range(0, xy.shape[0], step):
-                cv2.circle(img, (int(xy[i,0]), int(xy[i,1])), point_radius, colors[i].tolist(), -1, cv2.LINE_AA)
+            img_disp = und
 
-    # 6) 라벨
-    cv2.putText(img, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
-    return img
+    # 3) LiDAR가 꺼져 있으면 점만 생략하고 보정된 이미지만 반환
+    if (not draw_lidar) or (lidar_idx >= len(lidar_files)):
+        cv2.putText(img_disp, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
+        return img_disp
+
+    # 4) LiDAR 로드 및 필터링
+    pts = load_lidar_points(lidar_files[lidar_idx])
+    pts = filter_lidar_points(pts, max_range=120.0)
+    if len(pts) == 0:
+        cv2.putText(img_disp, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
+        return img_disp
+
+    # 5) LiDAR → 카메라 좌표
+    pts_cam = (R @ pts[:, :3].T).T + t.reshape(1,3)
+    Z = pts_cam[:,2]
+    front = (Z > 0.1) & (Z < 200.0)
+    if not np.any(front):
+        cv2.putText(img_disp, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
+        return img_disp
+    pts_cam = pts_cam[front]; Z = Z[front]
+
+    # 6) 사영
+    if calib_data and cam_idx < len(calib_data):
+        c = calib_data[cam_idx]
+        if use_ros:
+            # ROS: 보정 영상 좌표계에서 P로 직접 투영
+            P = c['P_rect'].astype(np.float64)
+            uvw = (P @ np.hstack([pts_cam, np.ones((pts_cam.shape[0],1))]).T).T
+            uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-9, None)
+        else:
+            if mode == 'undistorted':
+                Knew = c['K_new'].astype(np.float64)
+                xs, ys = pts_cam[:,0]/Z, pts_cam[:,1]/Z
+                uv1 = (Knew @ np.vstack([xs, ys, np.ones_like(xs)])).T
+                uv  = uv1[:,:2] / uv1[:, 2:3]
+                if alpha == 0.0:
+                    x,y,_,_ = c['roi']
+                    uv -= np.array([x, y], np.float64)  # ROI 오프셋 보정
+            elif mode == 'original':
+                K  = c['K'].astype(np.float64); D = c['D']
+                uv, _ = cv2.projectPoints(pts_cam, np.zeros(3), np.zeros(3), K, D)
+                uv = uv.reshape(-1,2)
+            else:
+                raise ValueError(f"Unknown projection mode: {mode}")
+    else:
+        # fallback (캘리브 없음) : 그냥 중앙투영
+        H, W = img_disp.shape[:2]
+        K = np.array([[1000,0,W/2.0],[0,1000,H/2.0],[0,0,1]], np.float64)
+        xs, ys = pts_cam[:,0]/Z, pts_cam[:,1]/Z
+        uv1 = (K @ np.vstack([xs, ys, np.ones_like(xs)])).T
+        uv  = uv1[:, :2] / uv1[:, 2:3]
+
+    # 7) in-bounds & 그리기
+    H, W = img_disp.shape[:2]
+    m = (uv[:,0]>=0)&(uv[:,0]<W)&(uv[:,1]>=0)&(uv[:,1]<H)
+    if np.any(m):
+        uv = uv[m].astype(np.int32)
+        pts_vis = pts_cam[m]
+
+        # ── 여기부터 색상 계산 교체 ───────────────────────────
+        rng = np.linalg.norm(pts_vis[:, :3], axis=1)  # 거리
+
+        if CFG.lidar_color_use_fixed_range:
+            vmin, vmax = float(CFG.lidar_color_min_m), float(CFG.lidar_color_max_m)
+        else:
+            vmin, vmax = float(np.min(rng)), float(np.max(rng))
+        if vmax <= vmin:
+            vmax = vmin + 1e-3
+
+        norm = (rng - vmin) / (vmax - vmin)
+        norm = np.clip(norm, 0.0, 1.0)
+        idx = (norm * 255.0).astype(np.uint8)
+
+        lut = _color_lut_256(CFG.lidar_cmap)   # ← turbo, turbo_r, jet, jet_r 등 지원
+        col = lut[idx]                          # BGR uint8
+        # ─────────────────────────────────────────────────────
+
+        for (u, v), c3 in zip(uv, col):
+            cv2.circle(img_disp, (int(u), int(v)), point_radius,
+                       (int(c3[0]), int(c3[1]), int(c3[2])), -1)
+
+
+
+    cv2.putText(img_disp, f"Cam{cam_idx+1} {_ts(img_path)}", (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120,255,0), 2)
+    return img_disp
+
 
 
 def build_canvas(imgs: List[np.ndarray]) -> np.ndarray:
@@ -550,7 +999,7 @@ def build_canvas(imgs: List[np.ndarray]) -> np.ndarray:
     canvas = np.vstack([row1, row2])
 
     # 하단 타임라인 영역(300px)
-    bottom_space = np.zeros((CFG.timeline_h, canvas.shape[1], 3), dtype=np.uint8)
+    bottom_space = np.zeros((CFG.timeline_h + CFG.overview_h, canvas.shape[1], 3), dtype=np.uint8)
     canvas = np.vstack([canvas, bottom_space])
 
     return canvas
@@ -632,6 +1081,123 @@ def _append_json(json_path: Path, obj: dict) -> None:
 # =========================
 # X) Export (copy) helpers
 # =========================
+
+# === [ADD] segments helpers ================================================
+
+def _intersect_segments(A: List[Tuple[int,int]], B: List[Tuple[int,int]]) -> List[Tuple[int,int]]:
+    """
+    A, B는 [l0,l1] 포함구간 리스트. 교집합(모두 포함되는 구간들)을 돌려준다.
+    반환은 정규화/병합하여 오름차순.
+    """
+    if not A or not B:
+        return []
+    a = _merge_segments(A, len(lidar_files))
+    b = _merge_segments(B, len(lidar_files))
+    out = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        a0,a1 = a[i]; b0,b1 = b[j]
+        s = max(a0,b0); e = min(a1,b1)
+        if s <= e:
+            out.append((s,e))
+        if a1 < b1: i += 1
+        else:       j += 1
+    return _merge_segments(out, len(lidar_files))
+
+
+# === [ADD] build merged (intersection) marks json ==========================
+
+def write_merged_marks_json(
+    cam_marks_path: Path,
+    gps_bad_path: Optional[Path],   # GNSS JSON이 '불가' 구간(start/end)이라면 이걸 주고
+    out_path: Optional[Path] = None # None이면 같은 폴더에 자동 네이밍
+) -> Tuple[Path, List[Tuple[int,int]]]:
+    """
+    cam_marks_path의 (startN,endN) 쌍과, gps_bad_path에서 얻은 '불가' 구간의 여집합
+    (= 허용구간)을 교집합하여 새로운 marks JSON을 생성한다.
+    카메라 인덱스는 (ls - l0) 오프셋으로 재계산하여 넣는다.
+
+    반환: (out_path, merged_lidar_segs)
+    """
+    # 1) 카메라 marks 로드
+    with cam_marks_path.open("r", encoding="utf-8") as f:
+        cam_data = json.load(f)
+    pairs = _pair_segments_from_marks(cam_data)  # (sid,(l0,l1),(c0,c1),st,ed)
+
+    # 2) GNSS 허용 구간 계산
+    total = len(lidar_files)
+    if gps_bad_path:
+        bads = _read_gps_bad_ranges(gps_bad_path)           # [(a,b)] 불가
+        allow = _complement_ranges(bads, 0, max(0,total-1)) # 허용
+    else:
+        allow = [(0, max(0,total-1))]  # GNSS 파일 없으면 전부 허용
+
+    # 3) 교집합 만들면서 새 엔트리 빌드
+    out_entries = []
+    merged_segs = []
+    seg_id = 1
+    for _sid, (l0,l1), (c0,c1), st, ed in pairs:
+        cams0 = list(map(int, c0))
+        Lseg  = [(int(l0), int(l1))]
+        inter = _intersect_segments(Lseg, allow)  # [(ls,le), ...]
+
+        for (ls, le) in inter:
+            # 카메라 시작/끝 오프셋 매핑
+            length = le - ls  # inclusive 차이를 위해 아래 +1 보정 사용
+            cam_start = []
+            cam_end   = []
+            for i in range(6):
+                ci0 = int(cams0[i]) + (ls - int(l0))
+                ci1 = ci0 + length
+                cam_start.append(ci0)
+                cam_end.append(ci1)
+
+            # START 스냅
+            start_snap = {
+                "label": f"start{seg_id}",
+                "timestamp": dt.datetime.now().isoformat(),
+                "lidar_idx": int(ls),
+                "cam_indices": cam_start,
+                "files": {
+                    "lidar": str(lidar_files[ls]) if 0 <= ls < len(lidar_files) else None,
+                    "cams": [
+                        str(camera_files[i][cam_start[i]]) if (0 <= cam_start[i] < len(camera_files[i])) else None
+                        for i in range(6)
+                    ]
+                }
+            }
+            # END 스냅 (동일 길이로 맞춤)
+            end_snap = {
+                "label": f"end{seg_id}",
+                "timestamp": dt.datetime.now().isoformat(),
+                "lidar_idx": int(le),
+                "cam_indices": cam_end,
+                "files": {
+                    "lidar": str(lidar_files[le]) if 0 <= le < len(lidar_files) else None,
+                    "cams": [
+                        str(camera_files[i][cam_end[i]]) if (0 <= cam_end[i] < len(camera_files[i])) else None
+                        for i in range(6)
+                    ]
+                }
+            }
+
+            out_entries.append(start_snap)
+            out_entries.append(end_snap)
+            merged_segs.append((ls, le))
+            seg_id += 1
+
+    # 4) 저장 경로
+    if out_path is None:
+        marks_dir = cam_marks_path.parent
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = cam_marks_path.stem
+        out_path = marks_dir / f"merged_{base}_{ts}.json"
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(out_entries, f, ensure_ascii=False, indent=2)
+
+    return out_path, merged_segs
+
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -755,10 +1321,10 @@ def _pair_segments_from_marks(data: list):
     starts, ends = {}, {}
     for it in data:
         label = it.get("label", "")
-        kind_sid = _get_sid(label)
-        if not kind_sid:
+        m = re.match(r"^(start|end)(\d+)$", label)
+        if not m:
             continue
-        kind, sid = kind_sid
+        kind, sid = m.group(1), int(m.group(2))
         if kind == "start": starts[sid] = it
         else: ends[sid] = it
 
@@ -766,18 +1332,23 @@ def _pair_segments_from_marks(data: list):
     pairs = []
     for sid in scene_ids:
         st = starts[sid]; ed = ends[sid]
-        # indices 포맷 우선
         if "indices" in st and "indices" in ed:
             l0 = int(st["indices"]["lidar_idx"])
             l1 = int(ed["indices"]["lidar_idx"])
-            c0 = list(map(int, st["indices"]["cam_idx"]))
-            c1 = list(map(int, ed["indices"]["cam_idx"]))
+            c0 = list(map(int, st["indices"].get("cam_idx", [0]*6)))
+            c1 = list(map(int, ed["indices"].get("cam_idx", [0]*6)))
         else:
-            # 현재 뷰어 포맷: top-level
+            # ↓↓↓ GNSS JSON처럼 cam_indices가 없어도 안전하게 처리
             l0 = int(st["lidar_idx"])
             l1 = int(ed["lidar_idx"])
-            c0 = list(map(int, st["cam_indices"]))
-            c1 = list(map(int, ed["cam_indices"]))
+            def _safe_cam(obj, n=6):
+                arr = obj.get("cam_indices")
+                if isinstance(arr, list) and len(arr) == n:
+                    return [int(x) for x in arr]
+                return [0]*n
+            c0 = _safe_cam(st)
+            c1 = _safe_cam(ed)
+
         pairs.append((sid, (l0, l1), (c0, c1), st, ed))
     return pairs
 
@@ -1323,20 +1894,36 @@ def create_timeline_matplotlib(current_lidar_idx, current_img_idx, control_mode,
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     plt.close(fig)
     return img
+
 def overlay_segment_marks(canvas, phase, snap_start, snap_end, segment_id,
-                          current_lidar_idx, current_img_idx, control_mode):
+                          current_lidar_idx, current_img_idx, control_mode, gps_allow_segs=None):
     H, W = canvas.shape[:2]
     timeline_h = CFG.timeline_h
+    overview_h = CFG.overview_h
 
-    # ✅ 최종 붙일 크기 그대로 생성
+    # 1) 타임라인 생성/붙이기 (위쪽)
     timeline_img = create_timeline_matplotlib(
         current_lidar_idx, current_img_idx, control_mode,
         snap_start, snap_end, segment_id,
         W, timeline_h
     )
+    canvas[H - (timeline_h + overview_h) : H - overview_h, :W] = timeline_img
 
-    # ✅ 리사이즈 하지 말고 그대로 붙이기
-    canvas[H - timeline_h:, :W] = timeline_img
+    # 2) 개요 바 생성/붙이기 (아래쪽)
+    segs = _extract_lidar_segments_from_marks(marks_json_path)
+    merged = _intersect_segments(segs, gps_allow_segs or []) if segs else []
+
+    overview_img = create_lidar_overview_bar(
+        total_lidar=len(lidar_files),
+        current_lidar_idx=current_lidar_idx,
+        segs=segs,
+        width=W,
+        height=overview_h,
+        extra_segs=(gps_allow_segs or []),
+        merged_segs=merged,
+    )
+    canvas[H - overview_h : H, :W] = overview_img
+
 
 # =========================
 # 7) PyQt6 UI 클래스들
@@ -1498,12 +2085,19 @@ class Viewer(QtWidgets.QMainWindow):
         self.snap_start: Dict[str, Any] = copy.deepcopy(initial_snap_start) if initial_snap_start else None
         self.snap_end: Dict[str, Any] = copy.deepcopy(initial_snap_end) if initial_snap_end else None
         self.undo_stack: List[Dict[str, Any]] = []  # 최근 저장(s/e) 스냅샷 버퍼(되돌리기용 1단계 이상도 가능)
-        self.cached_canvas: np.ndarray | None = None
+        self.cached_canvas: Optional[np.ndarray] = None
+
+        # gnss
+        self.gps_json_path: Optional[Path] = None
+        self.gps_bad_segs: List[Tuple[int,int]] = []    # ← 추가
+        self.gps_allow_segs: List[Tuple[int,int]] = []  # ← 추가
+
+        self.merged_segs: List[Tuple[int,int]] = []   # 빨강 표시용 (옵션)
 
         # ---- Segment marks ----
-        self.current_phase: str = None
-        self.snap_start: Dict[str, Any] = None
-        self.snap_end: Dict[str, Any] = None
+        # self.current_phase: str = None
+        # self.snap_start: Dict[str, Any] = None
+        # self.snap_end: Dict[str, Any] = None
         
         # ---- Individual control mode ----
         self.control_mode: str = "all"  # "all", "lidar", "cam1", "cam2", ..., "cam6"
@@ -1664,6 +2258,105 @@ class Viewer(QtWidgets.QMainWindow):
         self._refresh()
 
 
+    def _load_gnss_dialog(self):
+        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select GNSS JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        self._load_gnss_json(Path(path))
+
+    def _load_gnss_json(self, p: Path):
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # GNSS JSON -> (l0,l1) 목록
+            bad = []
+            for sid, (l0, l1), (_c0, _c1), _st, _ed in _pair_segments_from_marks(data):
+                a, b = int(l0), int(l1)
+                if a > b: a, b = b, a
+                bad.append((a, b))
+
+            total_n = len(lidar_files)
+            bad = _merge_and_clip_segments(bad, total_n)
+            allow = _complement_segments(bad, total_n)
+
+            self.gps_bad_ranges = bad
+            self.gps_allow_ranges = allow
+            self._toast(f"GNSS loaded: bad={bad} -> allow={allow}")
+            self._refresh()
+        except Exception as e:
+            self._toast(f"GNSS load failed: {e}")
+
+    def _load_gps_from_dialog(self):
+        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select GNSS bad JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        p = Path(path)
+        try:
+            bads = _read_gps_bad_ranges(p)  # [(a,b), ...] 불가구간
+        except Exception as e:
+            self._toast(f"GNSS JSON read failed: {e}")
+            return
+
+        self.gps_bad_segs = bads
+
+        last = len(lidar_files) - 1
+        if last >= 0:
+            self.gps_allow_segs = _complement_ranges(self.gps_bad_segs, 0, last)
+        else:
+            self.gps_allow_segs = []
+
+        print(f"[GNSS:comp] total_lidar={len(lidar_files)} last={last}")
+        print(f"[GNSS:comp] bad_len={len(self.gps_bad_segs)} allow_len={len(self.gps_allow_segs)}")
+        if self.gps_bad_segs:
+            print(f"[GNSS:comp] bad_sample={self.gps_bad_segs[:8]}")
+        if self.gps_allow_segs:
+            print(f"[GNSS:comp] allow_sample={self.gps_allow_segs[:8]}")
+
+        # 디버그 메시지로 실제 값 확인
+        self._toast(f"GNSS loaded. bad={len(self.gps_bad_segs)} allow={len(self.gps_allow_segs)}")
+        print("[GNSS] bad:", self.gps_bad_segs)
+        print("[GNSS] allow:", self.gps_allow_segs)
+
+        self._refresh()
+
+    def on_make_merged_json(self):
+        try:
+            # 1) 카메라 marks 선택 (기본: 현재 marks_json_path)
+            default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+            cam_path = marks_json_path if marks_json_path else None
+            if not cam_path or (not cam_path.exists()):
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self, "Select camera marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+                )
+                if not path:
+                    return
+                cam_path = Path(path)
+
+            # 2) GNSS '불가' JSON 선택
+            gpath, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Select GNSS-bad JSON (start/end are '불가' 구간)", default_dir, "JSON Files (*.json);;All Files (*)"
+            )
+            gps_bad = Path(gpath) if gpath else None
+
+            # 3) 생성
+            out_path, merged = write_merged_marks_json(cam_path, gps_bad, out_path=None)
+            self._log_export(f"[ok] merged marks saved: {out_path} (segments={len(merged)})")
+
+            # 4) 뷰에 빨강 반영 (선택사항: 여기선 즉시 반영)
+            self.merged_segs = merged
+            self._refresh()
+            self._toast("Merged JSON created.")
+        except Exception as e:
+            self._toast(f"Make merged JSON failed: {e}")
+
+
     def _reload_dataset(self, new_base_dir: Path):
         """marks JSON으로부터 추정된 base_dir로 데이터셋을 갈아끼움."""
         global camera_files, lidar_files, dataset_base_dir
@@ -1813,6 +2506,19 @@ class Viewer(QtWidgets.QMainWindow):
         v.addWidget(self.lbl_state)
         
         v.addSpacing(8)
+
+        # GPS
+        v.addWidget(self._sep("Load GNSS(GPS) JSON file"))
+        self.btn_load_gps = QtWidgets.QPushButton("Load GNSS(GPS) JSON…")
+        self.btn_load_gps.clicked.connect(self._load_gps_from_dialog)
+        v.addWidget(self.btn_load_gps)
+
+        # Merge
+        v.addWidget(self._sep("Merge GPS-Camera"))
+        self.btn_make_merged = QtWidgets.QPushButton("Make merged JSON…")
+        self.btn_make_merged.clicked.connect(self.on_make_merged_json)
+        v.addWidget(self.btn_make_merged)
+
         v.addWidget(self._sep("Export Scenes"))
 
         # Export 버튼 + 로그창
@@ -2105,7 +2811,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         # 타임라인 합성
         overlay_segment_marks(can, self.current_phase, self.snap_start, self.snap_end, self.segment_id, 
-                            self.lidar_idx, self.img_idx, self.control_mode)
+                            self.lidar_idx, self.img_idx, self.control_mode, self.gps_allow_segs,)
         return can
 
     def _refresh(self):
@@ -2313,14 +3019,21 @@ def initialize_data():
 
     marks_dir = (dataset_base_dir / "marks_json") if (dataset_base_dir and dataset_base_dir.exists()) else Path("./marks_json")
     marks_dir.mkdir(parents=True, exist_ok=True)
+
     run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
-    marks_json_path = marks_dir / f"{base_name}_syn_marks_{run_ts}.json"
+
+    # NEW: camera_<base>_<timestamp>_<worker>.json
+    prefix = getattr(CFG, "filename_prefix", "camera")
+    worker = _sanitize_token(getattr(CFG, "worker_name", "anon"))
+    marks_json_path = marks_dir / f"{prefix}_{base_name}_{run_ts}_{worker}.json"
+
     print(f"Marks will be saved to: {marks_json_path}")
 
-    # 새 세션이므로 초기 상태는 항상 start/1
+    # 새 세션 초기 상태
     initial_allowed_next, initial_segment_id = "start", 1
     initial_snap_start, initial_snap_end = None, None
+
 
 
 # =========================
