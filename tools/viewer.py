@@ -1225,6 +1225,7 @@ def copy_dir(src: Path, dst: Path, log=None):
     except Exception as e:
         if log: log(f"[error] copy dir failed: {src} -> {dst} ({e})")
 
+
 def _get_imu_csv_path(base_dir: Path) -> Optional[Path]:
     p = base_dir / "imu" / "imu_data.csv"
     return p if p.exists() else None
@@ -1389,6 +1390,120 @@ def export_scenes_from_marks(marks_json_path: Path,
         else:
             print(msg)
 
+    def _get_gps_csv_path(base_dir: Path) -> Optional[Path]:
+        # 규약: base_dir/GPS/odom_data_synced.csv
+        p = base_dir / "GPS" / "odom_data_synced.csv"
+        return p if p.exists() else None
+
+    def _load_gps_csv(gps_csv: Path) -> tuple[list[str], list[list[str]]]:
+        """
+        GPS CSV를 통째로 읽어 (header, rows) 반환.
+        - 타임 파싱/정렬 없음 (LiDAR 인덱스와 1:1 정렬 가정)
+        - dialect는 Sniffer, 실패 시 excel 폴백
+        """
+        import csv
+
+        with gps_csv.open("r", newline="", encoding="utf-8") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except Exception:
+                dialect = csv.excel
+
+            reader = csv.reader(f, dialect)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return [], []
+
+            rows = [row for row in reader]
+        return header, rows
+
+    def _parse_sec_nsec_from_row(header: list[str], row: list[str]) -> tuple[Optional[int], Optional[int]]:
+        """GPS 한 행에서 (sec, nsec) 추출 (여러 포맷 지원)"""
+        import re, math
+        h2i = {h: i for i, h in enumerate(header)}
+        # 1) sec / nsec
+        if "sec" in h2i and "nsec" in h2i:
+            try:
+                return int(row[h2i["sec"]]), int(row[h2i["nsec"]])
+            except: pass
+        # 2) header.stamp.secs / header.stamp.nsecs
+        if "header.stamp.secs" in h2i and "header.stamp.nsecs" in h2i:
+            try:
+                return int(row[h2i["header.stamp.secs"]]), int(row[h2i["header.stamp.nsecs"]])
+            except: pass
+        # 3) timestamp (float sec)
+        if "timestamp" in h2i:
+            try:
+                t = float(row[h2i["timestamp"]])
+                sec = int(math.floor(t))
+                nsec = int(round((t - sec) * 1e9))
+                return sec, nsec
+            except: pass
+        # 4) 첫 컬럼이 "sec_nsec" 패턴
+        if header and len(row) > 0:
+            m = re.match(r"^\s*(\d+)\s*[_-]\s*(\d+)\s*$", str(row[0]))
+            if m:
+                try:
+                    return int(m.group(1)), int(m.group(2))
+                except: pass
+        return None, None
+
+    def _ts_key(sec: int, nsec: int) -> str:
+        """LiDAR 키와 동일 포맷의 키 생성. (zero-pad 없이 'sec_nsec')"""
+        return f"{int(sec)}_{int(nsec)}"
+
+    def _build_gps_ts_index(header: list[str], rows: list[list[str]]) -> dict[str, int]:
+        """GPS: ts_key('sec_nsec') -> row_idx 맵 생성 (중복 키는 최초만 채택)"""
+        idx = {}
+        for i, r in enumerate(rows):
+            sec, nsec = _parse_sec_nsec_from_row(header, r)
+            if sec is None or nsec is None: 
+                continue
+            key = _ts_key(sec, nsec)
+            if key not in idx:
+                idx[key] = i
+        return idx
+
+    def _inject_index_values(header: list[str], rows: list[list[str]], values: list[int], colname: str = "index"):
+        """index 컬럼을 특정 값들로 주입(있으면 덮어쓰고, 없으면 맨 앞에 추가)"""
+        if not header:
+            return header, rows
+        header_out = header[:]
+        if colname in header_out:
+            j = header_out.index(colname)
+            out_rows = []
+            for v, r in zip(values, rows):
+                rr = r[:]
+                if j >= len(rr):
+                    rr += [""] * (j - len(rr) + 1)
+                rr[j] = str(v)
+                out_rows.append(rr)
+            return header_out, out_rows
+        else:
+            header_out = [colname] + header_out
+            out_rows = [[str(v)] + r for v, r in zip(values, rows)]
+            return header_out, out_rows
+
+    def _placeholder_row_like(header: list[str], sec: int, nsec: int) -> list[str]:
+        """GPS 누락 시 헤더 형태를 보존하는 placeholder 생성 (sec/nsec/timestamp 채우기 시도)"""
+        row = [""] * len(header)
+        h2i = {h: i for i, h in enumerate(header)}
+        if "sec" in h2i: row[h2i["sec"]] = str(int(sec))
+        if "nsec" in h2i: row[h2i["nsec"]] = str(int(nsec))
+        if "header.stamp.secs" in h2i: row[h2i["header.stamp.secs"]] = str(int(sec))
+        if "header.stamp.nsecs" in h2i: row[h2i["header.stamp.nsecs"]] = str(int(nsec))
+        if "timestamp" in h2i:
+            row[h2i["timestamp"]] = f"{sec + nsec*1e-9:.9f}"
+        # 첫 컬럼이 'sec_nsec' 관례라면 넣어줌
+        if header and re.match(r"^\s*(\w+)$", header[0] or "") and "_" in header[0]:
+            row[0] = _ts_key(sec, nsec)
+        return row
+
+
+
     def _get_imu_csv_path(base_dir: Path) -> Optional[Path]:
         p = base_dir / "imu" / "imu_data.csv"
         return p if p.exists() else None
@@ -1507,6 +1622,20 @@ def export_scenes_from_marks(marks_json_path: Path,
     # radar
     radar_files, radar_dirs = _list_radars_from_base(base_dir)
     radar_times = _precompute_radar_times(radar_files)
+
+    # GPS (규약 경로: base_dir/GPS/odom_data_synced.csv)
+    gps_header: list[str] = []
+    gps_rows: list[list[str]] = []
+    gps_ts_index: dict[str, int] = {}
+    gps_src = _get_gps_csv_path(base_dir)
+    if gps_src:
+        log(f"[info] GPS CSV     : {gps_src}")
+        gps_header, gps_rows = _load_gps_csv(gps_src)
+        gps_ts_index = _build_gps_ts_index(gps_header, gps_rows)
+        log(f"[info] GPS rows    : {len(gps_rows)} (ts-indexed={len(gps_ts_index)})")
+    else:
+        log(f"[warn] GPS CSV not found at {base_dir / 'GPS' / 'odom_data_synced.csv'}")
+
 
     # IMU (규약 경로: base_dir/imu/imu_data.csv)
     imu_header: List[str] = []
@@ -1643,6 +1772,8 @@ def export_scenes_from_marks(marks_json_path: Path,
                     imu_out_dir = scene_dir / "imu"
                     ensure_dir(imu_out_dir)
                     imu_out_csv = imu_out_dir / "imu.csv"
+
+                    import csv
                     
                     hdr_out, rows_out = _inject_reindex(imu_header, sel, colname="index")
 
@@ -1659,6 +1790,59 @@ def export_scenes_from_marks(marks_json_path: Path,
                 log(f"[info][scene {sid}] IMU not available, skipped")
         except Exception as e:
             log(f"[warn][scene {sid}] IMU slice failed: {e}")
+
+        # GPS
+        # ---- GPS 잘라 저장 (LiDAR TS로 정확 매칭, index = LiDAR k) ----
+        try:
+            if gps_rows and seg_len > 0:
+                matched_rows = []
+                idx_values   = []
+                missing = 0
+
+                for k in range(seg_len):
+                    lidar_src_k = lidar_xyzi_files[l0 + k]
+                    ts_str = ts_str_from_path(lidar_src_k) or _ts(lidar_src_k)  # "sec_nsec"
+                    # sec, nsec 재구성(정규화 위해)
+                    try:
+                        sec_s, nsec_s = ts_str.split("_")
+                        sec_i, nsec_i = int(sec_s), int(nsec_s)
+                    except Exception:
+                        # 비정상 파일명인 경우: 매칭 포기하고 placeholder
+                        sec_i, nsec_i = 0, 0
+
+                    key = _ts_key(sec_i, nsec_i)
+                    ridx = gps_ts_index.get(key, None)
+                    if ridx is not None:
+                        matched_rows.append(gps_rows[ridx])
+                    else:
+                        # 타임스탬프가 없으면 placeholder로 alignment 유지
+                        matched_rows.append(_placeholder_row_like(gps_header, sec_i, nsec_i))
+                        missing += 1
+                    idx_values.append(k)  # ✅ GPS index = LiDAR 로컬 k
+
+                hdr_out, rows_out = _inject_index_values(gps_header, matched_rows, idx_values, colname="index")
+
+                gps_out_dir = scene_dir / "GPS"
+                ensure_dir(gps_out_dir)
+                gps_out_csv = gps_out_dir / "odom_data_synced.csv"
+
+                import csv
+                with gps_out_csv.open("w", newline="", encoding="utf-8") as fcsv:
+                    writer = csv.writer(fcsv)
+                    if hdr_out:
+                        writer.writerow(hdr_out)
+                    writer.writerows(rows_out)
+
+                if missing > 0:
+                    log(f"[ok][scene {sid}] GPS slice saved: {gps_out_csv} (rows={len(rows_out)}, missing_ts={missing})")
+                else:
+                    log(f"[ok][scene {sid}] GPS slice saved: {gps_out_csv} (rows={len(rows_out)})")
+            else:
+                log(f"[info][scene {sid}] GPS not available, skipped")
+        except Exception as e:
+            log(f"[warn][scene {sid}] GPS slice failed: {e}")
+
+
 
         # scene_meta.json
         meta = {
