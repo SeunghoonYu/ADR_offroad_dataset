@@ -1818,7 +1818,7 @@ def export_scenes_from_marks(marks_json_path: Path,
                         # 타임스탬프가 없으면 placeholder로 alignment 유지
                         matched_rows.append(_placeholder_row_like(gps_header, sec_i, nsec_i))
                         missing += 1
-                    idx_values.append(k)  # ✅ GPS index = LiDAR 로컬 k
+                    idx_values.append(k)  # GPS index = LiDAR 로컬 k
 
                 hdr_out, rows_out = _inject_index_values(gps_header, matched_rows, idx_values, colname="index")
 
@@ -2219,43 +2219,6 @@ class ExportWorker(QtCore.QObject):
         finally:
             self.finished.emit()
 
-# def on_export_scenes(self):
-#     try:
-#         default_dir = str(((dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")).resolve())
-#         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-#             self, "Select marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
-#         )
-#         if not path:
-#             return
-
-#         self._log_export(f"[run] Export from: {path}")
-#         self.btn_export.setEnabled(False)
-#         self.prog.setValue(0)
-#         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-
-#         # 쓰레드 + 워커 구성
-#         self._exp_thread = QtCore.QThread(self)
-#         self._exp_worker = ExportWorker(Path(path), dataset_tag="SNU_mountain")
-#         self._exp_worker.moveToThread(self._exp_thread)
-#         self._exp_thread.started.connect(self._exp_worker.run)
-
-#         # 신호 연결
-#         self._exp_worker.log.connect(self._log_export)
-#         self._exp_worker.progress.connect(self.prog.setValue)
-#         self._exp_worker.finished.connect(self._exp_thread.quit)
-#         self._exp_worker.finished.connect(self._exp_worker.deleteLater)
-#         self._exp_thread.finished.connect(self._exp_thread.deleteLater)
-#         self._exp_thread.finished.connect(lambda: self.btn_export.setEnabled(True))
-#         self._exp_thread.finished.connect(lambda: QtWidgets.QApplication.restoreOverrideCursor())
-
-#         self._exp_thread.start()
-
-#     except Exception as e:
-#         self._log_export(f"[error] {e}")
-#         self.btn_export.setEnabled(True)
-#         QtWidgets.QApplication.restoreOverrideCursor()
-
-
 class Viewer(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2285,13 +2248,9 @@ class Viewer(QtWidgets.QMainWindow):
         self.gps_bad_segs: List[Tuple[int,int]] = []    # ← 추가
         self.gps_allow_segs: List[Tuple[int,int]] = []  # ← 추가
 
+        # merge gps + camera
         self.merged_segs: List[Tuple[int,int]] = []   # 빨강 표시용 (옵션)
 
-        # ---- Segment marks ----
-        # self.current_phase: str = None
-        # self.snap_start: Dict[str, Any] = None
-        # self.snap_end: Dict[str, Any] = None
-        
         # ---- Individual control mode ----
         self.control_mode: str = "all"  # "all", "lidar", "cam1", "cam2", ..., "cam6"
         self.individual_step: int = 1
@@ -2768,6 +2727,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         v.addWidget(self._sep("Export Scenes"))
 
+
         # Export 버튼 + 로그창
         self.btn_export = QtWidgets.QPushButton("Export Scenes (copy)")
         self.btn_export.clicked.connect(self._start_export_dialog)
@@ -2778,10 +2738,6 @@ class Viewer(QtWidgets.QMainWindow):
         self.txt_export.setMinimumHeight(160)
         v.addWidget(self.txt_export)
 
-        # self.btn_export_latest = QtWidgets.QPushButton("Export Latest marks_json (copy)")
-        # self.btn_export_latest.clicked.connect(self.on_export_latest)
-        # v.addWidget(self.btn_export_latest)
-
         self.prog = QProgressBar()
         self.prog.setRange(0, 100)
         self.prog.setValue(0)
@@ -2789,6 +2745,7 @@ class Viewer(QtWidgets.QMainWindow):
 
         v.addStretch(1)
         return w
+    
     def on_canvas_click(self, ix: int, iy: int):
         tile_w, tile_h = 640, 480
         grid_rows, grid_cols = 2, 3
@@ -3144,31 +3101,6 @@ class Viewer(QtWidgets.QMainWindow):
         finally:
             self.btn_export.setEnabled(True)
             QtWidgets.QApplication.restoreOverrideCursor()
-
-
-    # def on_export_latest(self):
-    #     try:
-    #         mj = (dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")
-    #         if not mj.exists():
-    #             self._log_export(f"[error] {mj} not found")
-    #             return
-    #         # 패턴을 *_syn_marks_*.json 으로 변경
-    #         candidates = sorted(mj.glob("*_syn_marks_*.json"))
-    #         if not candidates:
-    #             self._log_export("[error] no *_syn_marks_*.json")
-    #             return
-    #         chosen = candidates[-1]
-    #         self._log_export(f"[run] Export from latest: {chosen}")
-    #         self.btn_export_latest.setEnabled(False)
-    #         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-    #         self._start_export(chosen)
-    #     except Exception as e:
-    #         self._log_export(f"[error] {e}")
-    #     finally:
-    #         self.btn_export_latest.setEnabled(True)
-    #         QtWidgets.QApplication.restoreOverrideCursor()
-
-
 
 # =========================
 # 8) 전역 변수 및 초기화
