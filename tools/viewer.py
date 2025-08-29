@@ -78,6 +78,9 @@ class AppConfig:
     lidar_color_max_m: float = 50.0        
     lidar_max_display_range_m: float = 150.0  
 
+    # CLip params
+    clip_min_frames: int = 200
+
     
 
 CFG = AppConfig()
@@ -1543,6 +1546,12 @@ def export_scenes_from_marks(marks_json_path: Path,
         L_len = max(0, l1 - l0 + 1)
         C_len = [max(0, c1[i] - c0[i] + 1) for i in range(6)]
         seg_len = min([L_len] + C_len)
+
+        if seg_len < CFG.clip_min_frames:
+            if log_cb:
+                log_cb(f"[skip] scene {sid}: length={seg_len} < min_frames={CFG.clip_min_frames}")
+            continue
+
         if seg_len > 0:
             pair_infos.append((sid, (l0, l1), (c0, c1), seg_len, st, ed))
             total_frames += seg_len
@@ -2143,7 +2152,7 @@ class Viewer(QtWidgets.QMainWindow):
     def _start_export_dialog(self):
         default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select marks JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+            self, "Select MERGED JSON", default_dir, "JSON Files (*.json);;All Files (*)"
         )
         if not path:
             return
@@ -2435,7 +2444,7 @@ class Viewer(QtWidgets.QMainWindow):
         v.setSpacing(8)
 
         # json 불러오기
-        self.btn_resume = QtWidgets.QPushButton("Resume from marks JSON…")
+        self.btn_resume = QtWidgets.QPushButton("Resume from camera JSON…")
         self.btn_resume.clicked.connect(self._resume_from_dialog)
         v.addWidget(self.btn_resume)
 
@@ -2585,9 +2594,9 @@ class Viewer(QtWidgets.QMainWindow):
         self.txt_export.setMinimumHeight(160)
         v.addWidget(self.txt_export)
 
-        self.btn_export_latest = QtWidgets.QPushButton("Export Latest marks_json (copy)")
-        self.btn_export_latest.clicked.connect(self.on_export_latest)
-        v.addWidget(self.btn_export_latest)
+        # self.btn_export_latest = QtWidgets.QPushButton("Export Latest marks_json (copy)")
+        # self.btn_export_latest.clicked.connect(self.on_export_latest)
+        # v.addWidget(self.btn_export_latest)
 
         self.prog = QProgressBar()
         self.prog.setRange(0, 100)
@@ -2953,27 +2962,27 @@ class Viewer(QtWidgets.QMainWindow):
             QtWidgets.QApplication.restoreOverrideCursor()
 
 
-    def on_export_latest(self):
-        try:
-            mj = (dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")
-            if not mj.exists():
-                self._log_export(f"[error] {mj} not found")
-                return
-            # 패턴을 *_syn_marks_*.json 으로 변경
-            candidates = sorted(mj.glob("*_syn_marks_*.json"))
-            if not candidates:
-                self._log_export("[error] no *_syn_marks_*.json")
-                return
-            chosen = candidates[-1]
-            self._log_export(f"[run] Export from latest: {chosen}")
-            self.btn_export_latest.setEnabled(False)
-            QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self._start_export(chosen)
-        except Exception as e:
-            self._log_export(f"[error] {e}")
-        finally:
-            self.btn_export_latest.setEnabled(True)
-            QtWidgets.QApplication.restoreOverrideCursor()
+    # def on_export_latest(self):
+    #     try:
+    #         mj = (dataset_base_dir / "marks_json") if dataset_base_dir else Path("./marks_json")
+    #         if not mj.exists():
+    #             self._log_export(f"[error] {mj} not found")
+    #             return
+    #         # 패턴을 *_syn_marks_*.json 으로 변경
+    #         candidates = sorted(mj.glob("*_syn_marks_*.json"))
+    #         if not candidates:
+    #             self._log_export("[error] no *_syn_marks_*.json")
+    #             return
+    #         chosen = candidates[-1]
+    #         self._log_export(f"[run] Export from latest: {chosen}")
+    #         self.btn_export_latest.setEnabled(False)
+    #         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    #         self._start_export(chosen)
+    #     except Exception as e:
+    #         self._log_export(f"[error] {e}")
+    #     finally:
+    #         self.btn_export_latest.setEnabled(True)
+    #         QtWidgets.QApplication.restoreOverrideCursor()
 
 
 
