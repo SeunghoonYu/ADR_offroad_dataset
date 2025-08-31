@@ -62,12 +62,12 @@ class AppConfig:
     tile_h: int = 480
     timeline_h: int = 300
     overview_h: int = 120
-    overview_base_color: tuple = (180, 120, 60)   # BGR (파란 베이스)
-    overview_seg_color: tuple = (0, 160, 255)     # BGR (주황 박스)
+    overview_base_color: tuple = (100, 100, 100)   # BGR gray 
+    overview_seg_color: tuple = (180, 120, 60)     # BGR blue 
     overview_gps_allow_color: tuple = (30, 180, 60)  # 초록(= GPS 불가의 여집합, 사용 가능)
     overview_gps_post_thick: int = 4                 # 초록 기둥/상단 두께
     overview_base_thick: int = 12                 # 베이스 라인 두께
-    overview_post_thick: int = 6                  # 세그먼트 기둥/상단 두께
+    overview_post_thick: int = 4                  # 세그먼트 기둥/상단 두께
     overview_min_pix: int = 6                     # 세그민트 최소 픽셀 폭
     start_index_default: int = 100
 
@@ -374,7 +374,7 @@ def create_lidar_overview_bar(
     extra_segs: Optional[List[Tuple[int,int]]] = None,   # GNSS 허용 구간
     extra_color: Tuple[int,int,int] = (60, 200, 60),     # BGR (초록)
     merged_segs: Optional[List[Tuple[int,int]]] = None, # [ADD] 빨간(교집합)
-    merged_color: Tuple[int,int,int] = (0, 0, 255),     # [ADD]
+    merged_color: Tuple[int,int,int] = (0, 160, 255),     # [ADD]
     *,
     font_shrink: float = 0.3,       # 글씨를 얼마나 줄일지 (1.0=기존, 0.85=조금 작게)
     green_raise_px: int = 30,        # 초록 ㄷ자 바의 높이를 얼마나 더 올릴지(+픽셀)
@@ -2342,82 +2342,114 @@ class Viewer(QtWidgets.QMainWindow):
             del self._exp_thread
 
     def _resume_from_dialog(self):
-        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select marks JSON to resume",
-            default_dir, "JSON Files (*.json);;All Files (*)"
-        )
-        if not path:
-            return
+        """카메라 JSON을 선택해 로드하고, base_dir 추정 후 데이터셋/세그먼트 반영."""
+        import json
+        from pathlib import Path
+        global marks_json_path  # 전역 갱신은 맨 위에 선언
 
-        p = Path(path)
-        if not p.exists():
-            self._toast(f"File not found: {p}")
-            return
-
-        # JSON 로드
         try:
-            with p.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                if not isinstance(data, list):
-                    self._toast("Invalid marks format (not a list).")
-                    return
+            # 시작 폴더: camera_json_dir → 없으면 marks_root_dir → 마지막 폴백
+            start_dir = None
+            try:
+                if 'camera_json_dir' in globals() and camera_json_dir.exists():
+                    start_dir = camera_json_dir
+                elif 'marks_root_dir' in globals() and marks_root_dir.exists():
+                    start_dir = marks_root_dir
+            except Exception:
+                pass
+            if start_dir is None:
+                start_dir = Path(".")
+            dlg_filter = "JSON files (*.json);;All files (*)"
+            fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Resume from camera JSON", str(start_dir), dlg_filter
+            )
+            if not fname:
+                self._toast("Canceled.")
+                return
+
+            p = Path(fname)
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                self._toast(f"Resume failed (read): {e}")
+                return
+
+            # base_dir 추정 및 데이터셋 스위치
+            try:
+                new_base = _infer_base_dir_from_marks(data)
+                if new_base and new_base != dataset_base_dir:
+                    self._toast(f"Switch dataset to: {new_base}")
+                    self._reload_dataset(new_base)
+            except Exception as e:
+                self._toast(f"Resume failed (infer base): {e}")
+                return
+
+            # 선택한 카메라 marks 경로를 인스턴스/전역 모두에 반영
+            self.cam_marks_path = p
+            marks_json_path = p
+
+            # 상태 복구
+            try:
+                allowed, segid, sstart, send = _resume_state_from_marks(p)
+                self.allowed_next = allowed
+                self.segment_id = int(segid)
+                self.snap_start = copy.deepcopy(sstart) if sstart else None
+                self.snap_end   = copy.deepcopy(send) if send else None
+            except Exception as e:
+                self._toast(f"Resume failed (state): {e}")
+                # 상태 복구 실패해도 나머지 화면은 갱신할 수 있으니 계속 진행
+
+            # 보기 인덱스: 스냅샷 근처로 맞춤
+            ref_snap = self.snap_start if (getattr(self, "allowed_next", None) == "end" and self.snap_start) else self.snap_end
+            if ref_snap:
+                # LiDAR
+                lidx = int(ref_snap.get("lidar_idx", self.lidar_idx))
+                self.lidar_idx = int(np.clip(lidx, 0, max(0, len(lidar_files) - 1)))
+                # 카메라들
+                cam_indices = ref_snap.get("cam_indices", self.img_idx)
+                if isinstance(cam_indices, list) and len(cam_indices) == 6:
+                    new_cam_idx = []
+                    for i in range(6):
+                        max_i = max(0, len(camera_files[i]) - 1)
+                        new_cam_idx.append(int(np.clip(int(cam_indices[i]), 0, max_i)))
+                    self.img_idx = new_cam_idx
+
+            # UI 동기화
+            self.sld.blockSignals(True)
+            self.sld.setMaximum(max(0, len(lidar_files) - 1))
+            self.sld.setValue(self.lidar_idx)
+            self.sld.blockSignals(False)
+
+            self._toast(f"Resumed: allowed_next={getattr(self,'allowed_next',None)}, segment_id={getattr(self,'segment_id',None)}")
+            self._refresh_state_label()
+            self._refresh()
+
         except Exception as e:
-            self._toast(f"Failed to read JSON: {e}")
-            return
-
-        # base_dir 추정 및 데이터셋 스위치(필요 시)
-        inferred = _infer_base_dir_from_marks(data)
-        if inferred and (str(inferred) != str(dataset_base_dir)):
-            self._toast(f"Switch dataset to: {inferred}")
-            self._reload_dataset(inferred)
-
-        # append 타겟 변경
-        global marks_json_path
-        marks_json_path = p
-
-        # 상태 복구
-        allowed, segid, sstart, send = _resume_state_from_marks(p)
-        self.allowed_next = allowed
-        self.segment_id = int(segid)
-        self.snap_start = copy.deepcopy(sstart) if sstart else None
-        self.snap_end = copy.deepcopy(send) if send else None
-
-        # 보기 인덱스도 스냅샷 근처로 맞춤
-        # - 다음에 저장해야 할 대상(allowed_next)에 따라 기준 스냅샷을 선택
-        ref_snap = self.snap_start if (self.allowed_next == "end" and self.snap_start) else self.snap_end
-        if ref_snap:
-            # LiDAR
-            lidx = int(ref_snap.get("lidar_idx", self.lidar_idx))
-            self.lidar_idx = int(np.clip(lidx, 0, max(0, len(lidar_files)-1)))
-            # 카메라들
-            cam_indices = ref_snap.get("cam_indices", self.img_idx)
-            if isinstance(cam_indices, list) and len(cam_indices) == 6:
-                new_cam_idx = []
-                for i in range(6):
-                    max_i = max(0, len(camera_files[i]) - 1)
-                    new_cam_idx.append(int(np.clip(int(cam_indices[i]), 0, max_i)))
-                self.img_idx = new_cam_idx
-
-        # UI 동기화
-        self.sld.blockSignals(True)
-        self.sld.setValue(self.lidar_idx)
-        self.sld.setMaximum(max(0, len(lidar_files) - 1))
-        self.sld.blockSignals(False)
-
-        self._toast(f"Resumed: allowed_next={self.allowed_next}, segment_id={self.segment_id}")
-        self._refresh_state_label()
-        self._refresh()
+            self._toast(f"Resume failed: {e}")
 
 
-    def _load_gnss_dialog(self):
-        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select GNSS JSON", default_dir, "JSON Files (*.json);;All Files (*)"
-        )
-        if not path:
-            return
-        self._load_gnss_json(Path(path))
+
+    def _load_gnss_json_dialog(self):
+        try:
+            start_dir = gnss_json_dir if gnss_json_dir.exists() else marks_root_dir
+            dlg_filter = "JSON files (*.json);;All files (*)"
+            fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load GNSS JSON", str(start_dir), dlg_filter
+            )
+            if not fname:
+                self._toast("Canceled.")
+                return
+
+            self.gnss_json_path = Path(fname)
+            # GNSS JSON을 미리 파싱/검증해도 좋음
+            with self.gnss_json_path.open("r", encoding="utf-8") as f:
+                _ = json.load(f)
+            self._toast(f"Loaded GNSS JSON: {self.gnss_json_path.name}")
+
+        except Exception as e:
+            self._toast(f"Load GNSS failed: {e}")
+
 
     def _load_gnss_json(self, p: Path):
         try:
@@ -2443,9 +2475,13 @@ class Viewer(QtWidgets.QMainWindow):
             self._toast(f"GNSS load failed: {e}")
 
     def _load_gps_from_dialog(self):
-        default_dir = str(((dataset_base_dir / CFG.marks_subdir) if dataset_base_dir else Path("./marks_json")).resolve())
+        # NEW: 기본 경로를 gnss_json_dir → 없으면 marks_root_dir
+        default_dir = str((gnss_json_dir if gnss_json_dir.exists() else marks_root_dir).resolve())
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select GNSS bad JSON", default_dir, "JSON Files (*.json);;All Files (*)"
+            self,
+            "Select GNSS bad JSON",
+            default_dir,
+            "JSON Files (*.json);;All Files (*)"
         )
         if not path:
             return
@@ -2456,6 +2492,7 @@ class Viewer(QtWidgets.QMainWindow):
             self._toast(f"GNSS JSON read failed: {e}")
             return
 
+        # 기존 변수명 유지 (gps_bad_segs / gps_allow_segs)
         self.gps_bad_segs = bads
 
         last = len(lidar_files) - 1
@@ -2471,12 +2508,51 @@ class Viewer(QtWidgets.QMainWindow):
         if self.gps_allow_segs:
             print(f"[GNSS:comp] allow_sample={self.gps_allow_segs[:8]}")
 
-        # 디버그 메시지로 실제 값 확인
         self._toast(f"GNSS loaded. bad={len(self.gps_bad_segs)} allow={len(self.gps_allow_segs)}")
-        print("[GNSS] bad:", self.gps_bad_segs)
-        print("[GNSS] allow:", self.gps_allow_segs)
-
         self._refresh()
+
+
+    def _do_merge_camera_gnss(self):
+        """
+        self.cam_marks_path (camera) 와 self.gnss_json_path (gnss)를 읽어
+        교집합 세그먼트를 계산하고 merged JSON을 merge_json_dir 에 저장.
+        """
+        try:
+            if not hasattr(self, "cam_marks_path") or not self.cam_marks_path:
+                raise RuntimeError("Camera JSON not loaded. Use 'Resume from camera JSON…' first.")
+            if not hasattr(self, "gnss_json_path") or not self.gnss_json_path:
+                raise RuntimeError("GNSS JSON not loaded. Use 'Load GNSS JSON…' first.")
+
+            # 1) 원본 로드
+            with self.cam_marks_path.open("r", encoding="utf-8") as f:
+                cam_data = json.load(f)
+            with self.gnss_json_path.open("r", encoding="utf-8") as f:
+                gnss_data = json.load(f)
+
+            # 2) 교집합 계산 (여기서는 기존 로직을 그대로 호출/포팅하세요)
+            #    예: inter, out_list = some_merge_compute(cam_data, gnss_data)
+            #    아래는 가짜 예시:
+            inter = []      # [(ls, le), ...]
+            out_list = []   # merged JSON 리스트
+            # TODO: 실제 merge 로직으로 inter/out_list 채우기
+
+            # 3) 저장 경로: merge_json_dir 고정
+            run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            worker = _sanitize_token(getattr(CFG, "worker_name", "anon"))
+            base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
+            out_path = merge_json_dir / f"merged_{base_name}_{run_ts}_{worker}.json"
+
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(out_list, f, ensure_ascii=False, indent=2)
+
+            # 4) UI 반영
+            self.merged_segs = inter
+            self._toast(f"Merged JSON saved: {out_path.name}  (segments={len(inter)})")
+            self._refresh()
+
+        except Exception as e:
+            self._toast(f"Merge failed: {e}")
+
 
     def on_make_merged_json(self):
         try:
@@ -2487,7 +2563,7 @@ class Viewer(QtWidgets.QMainWindow):
                 self._toast("GNSS JSON(허용 구간)을 먼저 로드해주세요.")
                 return
 
-            # 1) 원본 카메라 세그먼트+카메라 시작 인덱스 로드
+            # 1) 원본 카메라 세그먼트 로드
             with open(marks_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             pairs = _pair_segments_from_marks(data)  # (sid, (l0,l1), (c0,c1), st, ed)
@@ -2497,36 +2573,27 @@ class Viewer(QtWidgets.QMainWindow):
                 self._toast("LiDAR 파일이 없습니다.")
                 return
 
-            # 2) 교집합(빨간) 계산: (카메라 세그들의 합집합) ∩ (GNSS 허용)
-            cam_segs = []
-            # cam 세그먼트는 병합해서 전체 카메라 허용으로
-            for sid, (l0, l1), (c0, c1), st, ed in pairs:
-                a, b = int(l0), int(l1)
-                if a > b: a, b = b, a
-                cam_segs.append((a, b))
-            cam_segs = _merge_segments(cam_segs, N)
-            inter = _intersect_segments(cam_segs, self.gps_allow_segs)  # ★ 교집합
-
+            # 2) 교집합 계산 (기존 로직 그대로)
+            inter = _intersect_segments(
+                _merge_segments([(int(min(l0,l1)), int(max(l0,l1))) for _, (l0,l1), *_ in pairs], N),
+                _merge_segments(self.gps_allow_segs, N)
+            )
             if not inter:
                 self._toast("교집합 구간이 없습니다.")
                 self.merged_segs = []
                 self._refresh()
                 return
 
-            # 3) 교집합을 '원본 세그먼트 쌍' 기준으로 쪼개서 start/end 스냅샷 생성
+            # 3) 교집합을 원본 세그먼트 기준으로 잘라 새 start/end 스냅샷 생성 (기존 로직 그대로)
             out_list = []
             new_sid = 1
-
-            # 원본 페어별로 교집합과 겹치는 부분만 분할
-            for _sid, (l0, l1), (c0, c1), _st, _ed in pairs:
+            for _sid, (l0,l1), (c0,c1), st, ed in pairs:
                 a0, a1 = int(l0), int(l1)
                 if a0 > a1: a0, a1 = a1, a0
-                # 이 원본 세그와 inter의 교집합
                 parts = _intersect_segments([(a0,a1)], inter)
                 for (s, e) in parts:
-                    if s > e: 
+                    if s > e:
                         continue
-                    # cam 인덱스는 시작 cam에서 offset 만큼 전진
                     off_s = s - a0
                     off_e = e - a0
                     cam_s = []
@@ -2537,29 +2604,28 @@ class Viewer(QtWidgets.QMainWindow):
                         ce = int(np.clip(int(c0[i]) + off_e, 0, max_i))
                         cam_s.append(cs)
                         cam_e.append(ce)
-
-                    # 새 start/end 스냅샷
                     snapS = _build_snapshot(f"start{new_sid}", s, cam_s)
                     snapE = _build_snapshot(f"end{new_sid}",   e, cam_e)
                     out_list.append(snapS); out_list.append(snapE)
                     new_sid += 1
 
-            # 4) 파일로 저장
+            # 4) ★ 저장 경로를 merge_json_dir로 고정 ★
             run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             worker = _sanitize_token(getattr(CFG, "worker_name", "anon"))
             base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
-            out_path = (marks_json_path.parent /
-                        f"merged_{base_name}_{run_ts}_{worker}.json")
+            out_path = merge_json_dir / f"merged_{base_name}_{run_ts}_{worker}.json"
+
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(out_list, f, ensure_ascii=False, indent=2)
 
-            # 5) 뷰에 빨간(교집합) ㄷ자 적용
+            # 5) UI 반영
             self.merged_segs = inter
             self._toast(f"Merged JSON saved: {out_path.name}  (segments={new_sid-1})")
             self._refresh()
 
         except Exception as e:
             self._toast(f"Merge failed: {e}")
+
 
 
 
@@ -2722,6 +2788,7 @@ class Viewer(QtWidgets.QMainWindow):
         # Merge
         v.addWidget(self._sep("Merge GPS-Camera"))
         self.btn_make_merged = QtWidgets.QPushButton("Make merged JSON…")
+        # self.btn_make_merged.clicked.connect(self._do_merge_camera_gnss)
         self.btn_make_merged.clicked.connect(self.on_make_merged_json)
         v.addWidget(self.btn_make_merged)
 
@@ -3161,7 +3228,7 @@ def _resume_state_from_marks(marks_path: Path) -> Tuple[str, int, Optional[dict]
 
 def _find_latest_marks(marks_dir: Path, base_name: str) -> Optional[Path]:
     """marks_dir에서 base_name 접두의 *_syn_marks_*.json 중 가장 최신을 고른다."""
-    if not marks_dir.exists():
+    if not marks_dir or not marks_dir.exists():
         return None
     candidates = sorted(marks_dir.glob(f"{base_name}_syn_marks_*.json"))
     return candidates[-1] if candidates else None
@@ -3170,6 +3237,8 @@ def _find_latest_marks(marks_dir: Path, base_name: str) -> Optional[Path]:
 def initialize_data():
     global camera_files, lidar_files, calib_data, marks_json_path, dataset_base_dir
     global initial_allowed_next, initial_segment_id, initial_snap_start, initial_snap_end
+    # 추가: 다른 로직에서 재사용할 수 있도록 세 경로를 전역으로 노출
+    global marks_root_dir, camera_json_dir, gnss_json_dir, merge_json_dir
 
     print("Loading scene metadata...")
     scene_meta = load_scene_meta()
@@ -3189,22 +3258,49 @@ def initialize_data():
         print("No calibration file found, using default parameters")
         calib_data = None
 
-    marks_dir = (dataset_base_dir / "marks_json") if (dataset_base_dir and dataset_base_dir.exists()) else Path("./marks_json")
-    marks_dir.mkdir(parents=True, exist_ok=True)
+    # ===== 새로운 JSON 저장/로드 루트 디렉터리 구조 =====
+    # base_dir 가 /mnt/e/off-road/data_0822/test0822_15_22 라면
+    #   /mnt/e/off-road/data_0822/test0822_15_22_marks_json/ 아래에
+    #   camera_lidar_json, gnss_lidar_json, merge_camera_gnss_json 생성
+    if dataset_base_dir and dataset_base_dir.exists():
+        marks_root_dir = dataset_base_dir.parent / f"{dataset_base_dir.name}_marks_json"
+    else:
+        # dataset_base_dir 을 못 구했을 때의 안전한 폴백
+        marks_root_dir = Path("./marks_json_root")
 
+    camera_json_dir = marks_root_dir / "camera_lidar_json"
+    gnss_json_dir = marks_root_dir / "gnss_lidar_json"
+    merge_json_dir = marks_root_dir / "merge_camera_gnss_json"
+
+    for d in (camera_json_dir, gnss_json_dir, merge_json_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # 파일명 구성 요소
     run_ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = dataset_base_dir.name if dataset_base_dir else "dataset"
 
-    # NEW: camera_<base>_<timestamp>_<worker>.json
-    prefix = getattr(CFG, "filename_prefix", "camera")
+    # prefix 에 따라 저장 위치 자동 분기 (기본 camera)
+    # 기존 코드 참조: prefix/worker 기반 파일명 규칙 유지
+    prefix = getattr(CFG, "filename_prefix", "camera")  # ex) "camera" / "gnss" / "merge"
     worker = _sanitize_token(getattr(CFG, "worker_name", "anon"))
-    marks_json_path = marks_dir / f"{prefix}_{base_name}_{run_ts}_{worker}.json"
 
+    if prefix == "camera":
+        target_dir = camera_json_dir
+    elif prefix == "gnss":
+        target_dir = gnss_json_dir
+    elif prefix == "merge":
+        target_dir = merge_json_dir
+    else:
+        # 알 수 없는 prefix 는 camera 로 폴백
+        target_dir = camera_json_dir
+
+    marks_json_path = target_dir / f"{prefix}_{base_name}_{run_ts}_{worker}.json"
     print(f"Marks will be saved to: {marks_json_path}")
 
     # 새 세션 초기 상태
     initial_allowed_next, initial_segment_id = "start", 1
     initial_snap_start, initial_snap_end = None, None
+
 
 
 
