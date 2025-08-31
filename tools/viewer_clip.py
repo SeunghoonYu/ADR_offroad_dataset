@@ -371,27 +371,19 @@ def create_lidar_overview_bar(
     segs: List[Tuple[int,int]],
     width: int,
     height: int,
-    extra_segs: Optional[List[Tuple[int,int]]] = None,   # GNSS 허용 구간(초록)
-    extra_color: Tuple[int,int,int] = (60, 200, 60),     # BGR
-    merged_segs: Optional[List[Tuple[int,int]]] = None,  # 교집합(아래쪽 ㄷ바)
-    merged_color: Tuple[int,int,int] = (0, 160, 255),
-    # ★ 추가: clip ㄷ바(최상단, 보라색)
-    clip_segs: Optional[List[Tuple[int,int]]] = None,
-    clip_color: Tuple[int,int,int] = (200, 50, 200),
+    extra_segs: Optional[List[Tuple[int,int]]] = None,   # GNSS 허용 구간
+    extra_color: Tuple[int,int,int] = (60, 200, 60),     # BGR (초록)
+    merged_segs: Optional[List[Tuple[int,int]]] = None, # [ADD] 빨간(교집합)
+    merged_color: Tuple[int,int,int] = (0, 160, 255),     # [ADD]
     *,
-    font_shrink: float = 0.3,        # 글씨 축소 비율
-    green_raise_px: int = 30,        # 초록 ㄷ바 상단 높이 보정(+픽셀)
-    green_post_th_add: int = 2,      # 초록 ㄷ바 두께 보정
-    clip_raise_px: int = 50,         # ★ 보라 ㄷ바 상단 높이 보정(+픽셀)
-    clip_post_th_add: int = 2        # ★ 보라 ㄷ바 두께 보정
+    font_shrink: float = 0.3,       # 글씨를 얼마나 줄일지 (1.0=기존, 0.85=조금 작게)
+    green_raise_px: int = 30,        # 초록 ㄷ자 바의 높이를 얼마나 더 올릴지(+픽셀)
+    green_post_th_add: int = 2       # 초록 ㄷ자 기둥/상단 두께를 얼마나 더 두껍게
 ) -> np.ndarray:
     """
-    화살표 베이스(파란) + 세그먼트 ㄷ바(주황) + GNSS ㄷ바(초록) + 교집합 ㄷ바(아래, merged_color)
-    + ★ CLIP ㄷ바(보라, 맨 위) 를 그립니다.
-    각 ㄷ바의 start/end 인덱스 라벨도 표기합니다.
+    화살표 베이스(파란색) + 세그먼트 ㄷ자(주황색) + extra_segs ㄷ자(초록색) 오버뷰 바.
+    초록 ㄷ자는 더 높고(=더 위쪽) 약간 더 두껍게, 글씨는 살짝 작게.
     """
-    import cv2
-    import numpy as np
 
     def _put_label(img, text, org, fs, color, thick=1, pad=3):
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, thick)
@@ -413,6 +405,8 @@ def create_lidar_overview_bar(
     th_main  = max(1, int(round(2 * base_scale)))
     th_small = max(1, int(round(2 * base_scale)))
 
+    
+
     img = np.full((height, width, 3), 255, np.uint8)
     red_drop = 40
     pad_l, pad_r = 24, 36
@@ -420,7 +414,6 @@ def create_lidar_overview_bar(
     rail_y = height - pad_b - CFG.overview_base_thick // 2 - red_drop
     x0, x1 = pad_l, width - pad_r
 
-    # 베이스 레일(→)
     base_c = CFG.overview_base_color
     cv2.line(img, (x0, rail_y), (x1, rail_y), base_c, CFG.overview_base_thick, cv2.LINE_AA)
     head_w, head_h = 16, 12
@@ -436,9 +429,8 @@ def create_lidar_overview_bar(
 
     seg_c   = CFG.overview_seg_color
     post_th = CFG.overview_post_thick
-    top_y_orange = rail_y - 22                        # 주황 ㄷ바 상단 y
-    top_y_green  = top_y_orange - green_raise_px      # 초록 ㄷ바 상단 y
-    top_y_clip   = top_y_orange - max(green_raise_px, 0) - clip_raise_px  # ★ 보라 ㄷ바 상단 y
+    top_y_orange = rail_y - 22              # 주황 ㄷ자의 상단 y
+    top_y_green  = top_y_orange - green_raise_px  # 초록 ㄷ자는 더 위로(=더 높게)
     min_px  = CFG.overview_min_pix
 
     def _draw_cap(xa, xb, y_top, color, thick):
@@ -455,7 +447,10 @@ def create_lidar_overview_bar(
             xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
             xa = max(x0, xa); xb = min(x1, xb)
 
-        _draw_cap(xa, xb, top_y_orange, seg_c, post_th)
+        # ㄷ자
+        cv2.line(img, (xa, rail_y), (xa, top_y_orange), seg_c, post_th, cv2.LINE_AA)
+        cv2.line(img, (xb, rail_y), (xb, top_y_orange), seg_c, post_th, cv2.LINE_AA)
+        cv2.line(img, (xa, top_y_orange), (xb, top_y_orange), seg_c, post_th, cv2.LINE_AA)
 
         # 라벨
         if (xb - xa) >= (min_px + 12):
@@ -476,56 +471,31 @@ def create_lidar_overview_bar(
                 xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
                 xa = max(x0, xa); xb = min(x1, xb)
 
-            _draw_cap(xa, xb, top_y_green, c2, post_th_green)
+            # 초록 ㄷ자 (더 높고, 더 두껍게)
+            cv2.line(img, (xa, rail_y), (xa, top_y_green), c2, post_th_green, cv2.LINE_AA)
+            cv2.line(img, (xb, rail_y), (xb, top_y_green), c2, post_th_green, cv2.LINE_AA)
+            cv2.line(img, (xa, top_y_green), (xb, top_y_green), c2, post_th_green, cv2.LINE_AA)
 
+            # 라벨 위치도 초록 상단 기준
             if (xb - xa) >= (min_px + 12):
                 _put_label(img, str(a), (xa - 6, top_y_green - 6), fs_small, c2, th_small)
                 _put_label(img, str(b), (xb - 6, top_y_green - 6), fs_small, c2, th_small)
             else:
                 _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, top_y_green - 6), fs_small, c2, th_small)
 
-    # ── ★ 보라(CLIP) 구간들 + 라벨(최상단) ──
-    if clip_segs:
-        c3 = clip_color
-        post_th_clip = post_th + int(clip_post_th_add)
-        for a, b in clip_segs:
-            if a > b: a, b = b, a
-            xa, xb = ix_to_x(a), ix_to_x(b)
-            if xb - xa < min_px:
-                mid = (xa + xb) // 2
-                xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
-                xa = max(x0, xa); xb = min(x1, xb)
-
-            _draw_cap(xa, xb, top_y_clip, c3, post_th_clip)
-
-            if (xb - xa) >= (min_px + 12):
-                _put_label(img, str(a), (xa - 6, top_y_clip - 6), fs_small, c3, th_small)
-                _put_label(img, str(b), (xb - 6, top_y_clip - 6), fs_small, c3, th_small)
-            else:
-                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, top_y_clip - 6), fs_small, c3, th_small)
-
-    # ── 빨강(merged 교집합) 구간들 + 라벨(아래쪽) ──
     if merged_segs:
         bottom_y_red = rail_y + 22
         for a, b in merged_segs:
             if a > b: a, b = b, a
             xa, xb = ix_to_x(a), ix_to_x(b)
             if xb - xa < min_px:
-                mid = (xa + xb)//2
+                mid = (xa+xb)//2
                 xa, xb = mid - min_px//2, mid + int(np.ceil(min_px/2))
                 xa = max(x0, xa); xb = min(x1, xb)
-
-            # 아래쪽 ㄷ바
-            cv2.line(img, (xa, rail_y), (xa, bottom_y_red), merged_color, post_th + 2, cv2.LINE_AA)
-            cv2.line(img, (xb, rail_y), (xb, bottom_y_red), merged_color, post_th + 2, cv2.LINE_AA)
-            cv2.line(img, (xa, bottom_y_red), (xb, bottom_y_red), merged_color, post_th + 2, cv2.LINE_AA)
-
-            # ★ 라벨(아래쪽)
-            if (xb - xa) >= (min_px + 12):
-                _put_label(img, str(a), (xa - 6, bottom_y_red + 16), fs_small, merged_color, th_small)
-                _put_label(img, str(b), (xb - 6, bottom_y_red + 16), fs_small, merged_color, th_small)
-            else:
-                _put_label(img, f"{a}-{b}", ((xa + xb)//2 - 10, bottom_y_red + 16), fs_small, merged_color, th_small)
+            # 아래쪽으로 기둥/캡
+            cv2.line(img, (xa, rail_y), (xa, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
+            cv2.line(img, (xb, rail_y), (xb, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
+            cv2.line(img, (xa, bottom_y_red), (xb, bottom_y_red), merged_color, post_th+2, cv2.LINE_AA)
 
     # 현재 인덱스 / 양끝
     cx = ix_to_x(current_lidar_idx)
