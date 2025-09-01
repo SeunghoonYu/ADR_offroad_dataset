@@ -24,7 +24,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QShortcut, QKeySequence
 
 # ---- 기존 viewer 모듈 재사용 ----
-import viewer as V  # 같은 디렉토리의 viewer.py
+import merge_viewer as V  # 같은 디렉토리의 viewer.py
 
 # Wayland 경고 회피(필요 시)
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -102,7 +102,7 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.view_scale = getattr(V.CFG, "display_scale", 0.5)  # 표시 배율(기본 50%)
 
         self.num_cams = len(self.camera_files) if self.camera_files else 6
-        self.step_size = 1  # ← 좌/우 이동 step
+        self.step_size = int(getattr(V.CFG, "arrow_step_default", 1))  # ← 좌/우 이동 step (패널에서 변경 가능)
 
         # ---- UI 구성 ----
         self._build_ui()
@@ -140,7 +140,7 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.setStatusBar(self.status)
 
         # === Keyboard shortcuts ===
-        QShortcut(QKeySequence(Qt.Key.Key_Space),        self, activated=self._toggle_lidar)
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._toggle_lidar)
         QShortcut(QKeySequence(Qt.Key.Key_Left),  self, activated=lambda: self._nudge_lidar(-self.step_size))
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self._nudge_lidar(+self.step_size))
         QShortcut(QKeySequence(Qt.Key.Key_BracketLeft),  self, activated=self._go_prev_merged)
@@ -188,6 +188,19 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.lbl_seg = QtWidgets.QLabel("allowed_next = start | segment_id = 1")
         gv.addWidget(self.lbl_seg)
         v.addWidget(g)
+
+        # --- 이동 스텝 설정 ---
+        step_box = QtWidgets.QGroupBox("Navigation Step")
+        sv = QtWidgets.QHBoxLayout(step_box)
+        lbl = QtWidgets.QLabel("Arrow key step:")
+        self.spn_step = QtWidgets.QSpinBox()
+        self.spn_step.setRange(1, max(1000, len(self.lidar_files)))
+        self.spn_step.setAccelerated(True)
+        self.spn_step.setValue(self.step_size)
+        self.spn_step.valueChanged.connect(self._on_step_changed)
+        sv.addWidget(lbl)
+        sv.addWidget(self.spn_step)
+        v.addWidget(step_box)
 
         # --- Merged Navigate ---
         nav = QtWidgets.QGroupBox("Merged Navigate")
@@ -386,6 +399,12 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.draw_lidar = bool(on)
         self._refresh_all()
 
+    def _on_step_changed(self, val: int):
+        self.step_size = int(val)
+        # 원하는 경우 슬라이더 키보드 이동량도 동일하게:
+        # self.sld.setSingleStep(self.step_size)
+        self._toast(f"Arrow step = {self.step_size}")
+
     # -------------- 파일 로드/저장 --------------
 
     def _load_merged_json_dialog(self):
@@ -474,6 +493,7 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self._refresh_seg_label()
         self._refresh_clip_pairs()
         self._toast(f"Clip json opened: {self.clip_json_path.name}")
+        self._refresh_all()
 
     # -------------- Clip 마킹 --------------
 
@@ -538,6 +558,7 @@ class ClipViewer(V.QtWidgets.QMainWindow):
             with self.clip_json_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             self._refresh_clip_pairs()
+            self._refresh_all()
         except Exception as e:
             self._toast(f"Append failed: {e}")
 

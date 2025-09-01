@@ -375,7 +375,6 @@ def create_lidar_overview_bar(
     extra_color: Tuple[int,int,int] = (60, 200, 60),     # BGR
     merged_segs: Optional[List[Tuple[int,int]]] = None,  # 교집합(아래쪽 ㄷ바)
     merged_color: Tuple[int,int,int] = (0, 160, 255),
-    # ★ 추가: clip ㄷ바(최상단, 보라색)
     clip_segs: Optional[List[Tuple[int,int]]] = None,
     clip_color: Tuple[int,int,int] = (200, 50, 200),
     *,
@@ -489,22 +488,28 @@ def create_lidar_overview_bar(
         c3 = clip_color
         post_th_clip = post_th + int(clip_post_th_add)
         for a, b in clip_segs:
-            if a > b: a, b = b, a
+            if a > b: 
+                a, b = b, a
             xa, xb = ix_to_x(a), ix_to_x(b)
             if xb - xa < min_px:
                 mid = (xa + xb) // 2
                 xa, xb = mid - min_px // 2, mid + int(np.ceil(min_px / 2))
                 xa = max(x0, xa); xb = min(x1, xb)
 
-            _draw_cap(xa, xb, top_y_clip, c3, post_th_clip)
+            # 가로 캡 y 위치: 화면 위로 넘어가지 않게 클램프
+            y_top = max(pad_t + 4, top_y_clip)   # <-- '- 30' 제거 + 안전 클램프
+            _draw_cap(xa, xb, y_top, c3, post_th_clip)
 
+            # 라벨도 캡 높이에 맞춰서
+            label_y = max(pad_t + 6, y_top - 6)
             if (xb - xa) >= (min_px + 12):
-                _put_label(img, str(a), (xa - 6, top_y_clip - 6), fs_small, c3, th_small)
-                _put_label(img, str(b), (xb - 6, top_y_clip - 6), fs_small, c3, th_small)
+                _put_label(img, str(a), (xa - 6, label_y), fs_small, c3, th_small)
+                _put_label(img, str(b), (xb - 6, label_y), fs_small, c3, th_small)
             else:
-                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, top_y_clip - 6), fs_small, c3, th_small)
+                _put_label(img, f"{a}-{b}", ((xa + xb) // 2 - 10, label_y), fs_small, c3, th_small)
 
-    # ── 빨강(merged 교집합) 구간들 + 라벨(아래쪽) ──
+
+    # ── (merged 교집합) 구간들 + 라벨(아래쪽) ──
     if merged_segs:
         bottom_y_red = rail_y + 22
         for a, b in merged_segs:
