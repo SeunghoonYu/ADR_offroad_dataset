@@ -3,7 +3,7 @@
 
 """
 Clip Viewer
-- 기존 viewer.py의 시각화/보정/투영/타임라인/Export 유틸을 그대로 재사용
+- 기존 merge_viewer.py의 시각화/보정/투영/타임라인/Export 유틸을 그대로 재사용
 - merged JSON만 로드하여 오버뷰에 '교집합' 영역만 보여줌
 - 교집합 내부에서 2차 clip start/end를 정의해 'final_clip' JSON으로 저장
 - Export는 '내보낼 CLIP JSON'을 별도로 Load 해서 복사 수행
@@ -105,24 +105,70 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.step_size = int(getattr(V.CFG, "arrow_step_default", 1))  # ← 좌/우 이동 step (패널에서 변경 가능)
 
         # ---- UI 구성 ----
+        self._last_pixmap = None
         self._build_ui()
         self._refresh_all()
 
     # ---------------- UI ----------------
 
+    def resizeEvent(self, e: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(e)
+        self._update_canvas_scaled()
+
+    def _update_canvas_scaled(self):
+        """scroll viewport 크기에 맞춰 self._last_pixmap을 비율 유지 스케일."""
+        if not self._last_pixmap:
+            return
+        vp = self.scroll.viewport().size()
+        iw, ih = self._last_pixmap.width(), self._last_pixmap.height()
+        if iw <= 0 or ih <= 0 or vp.width() <= 0 or vp.height() <= 0:
+            return
+
+        # 진행바가 보일 때는 그 높이만큼 세로 공간에서 제외
+        extra_h = (self.progress.sizeHint().height() + self.center_v.spacing()) if self.progress.isVisible() else 0
+        avail_w = max(1, vp.width())
+        avail_h = max(1, vp.height() - extra_h)
+
+        s = min(avail_w / iw, avail_h / ih)
+        s = max(0.1, min(4.0, s))  # 과도한 확대/축소 클램프
+
+        tw, th = int(iw * s), int(ih * s)
+        scaled = self._last_pixmap.scaled(tw, th,
+                                        Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation)
+        self.lbl_canvas.setPixmap(scaled)
+
+
     def _build_ui(self):
         self.setWindowTitle("Clip Viewer (merged→clip→export)")
         self.resize(1920, 1200)
 
-        # 중앙: 이미지 캔버스 QLabel 하나에 합성 이미지를 넣는 방식
+        # 중앙: 스크롤 가능 + (이미지, 진행바) 세로 배치
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
+
+        self.center = QtWidgets.QWidget()
+        self.center_v = QtWidgets.QVBoxLayout(self.center)
+        self.center_v.setContentsMargins(0, 0, 0, 0)
+        self.center_v.setSpacing(6)
 
         self.lbl_canvas = QtWidgets.QLabel()
         self.lbl_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_canvas.setStyleSheet("background-color: black;")
+        # 내용 크기에 맞춰 스케일(수동)할 것이므로 Ignored 정책
+        self.lbl_canvas.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                    QtWidgets.QSizePolicy.Policy.Ignored)
 
-        self.scroll.setWidget(self.lbl_canvas)
+        # 진행바(기본 숨김)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)  # 필요할 때만 보여주기
+
+        self.center_v.addWidget(self.lbl_canvas, 1)
+        self.center_v.addWidget(self.progress, 0)
+
+        self.scroll.setWidget(self.center)
         self.setCentralWidget(self.scroll)
 
         # 창 기본 크기도 살짝 줄이기
@@ -768,6 +814,8 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         # QLabel 갱신
         qimg = QtGui.QImage(canvas.data, canvas.shape[1], canvas.shape[0],
                             canvas.strides[0], QtGui.QImage.Format.Format_BGR888)
+        self._last_pixmap = QtGui.QPixmap.fromImage(qimg)
+        self._update_canvas_scaled()
         pix = QtGui.QPixmap.fromImage(qimg)
 
         s = float(self.view_scale)
