@@ -30,35 +30,26 @@ from typing import Callable
 import csv
 from functools import lru_cache
 
-# =========================
-# 0) CONFIG (한 곳에서 수정)
-# =========================
 @dataclass
 class AppConfig:
-    # Indexing MArks filename config
-    # {sensor}_{origin_data_folder_name}_{postprocessing_time}_{worker_name}.json
+    # 필수
+    base_dir: Path = Path("/mnt/e/off-road/offroad_dataset_origin/siheung_land/test0826_18_06")
+    worker_name: str = "sh"
+
+    # 선택 입력(안 주면 base_dir로 자동 계산)
+    origin_root: Optional[Path] = None
+    marks_json_root: Optional[Path] = None
+    final_clips_root: Optional[Path] = None
+    dataset_tag: Optional[str] = None
+
+    # 나머지 기존 설정들은 그대로
     filename_prefix: str = "camera"
-    worker_name: str = "TonyStark"
 
-    # 데이터셋 루트 (읽기/marks_json 저장의 기준)
-    base_dir: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_origin/kwangmyeong_land/test0822_15_22")     # kwangmyeong_land, sihueng_land, sihueng_lake, siheung_farmland
-
-    # 수정본
-    origin_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_origin")
-    marks_json_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_marks_json")
-    final_clips_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_final_scenes")
-
-    # 씬 export 네이밍 접두
-    dataset_tag: str = "kwangmyeong_land"  # kwangmyeong_land, sihueng_land, sihueng_lake, siheung_farmland
-
-    # 보정 파일 경로(없으면 기본 파라미터 사용)
-    calib_yaml: Optional[Path] = Path("./calib_matrix/matrix0801.yaml")
-
-    # 서브폴더/이름 규칙들
+    # 뷰어/경로 규칙들(그대로 유지)
     marks_subdir: str = "marks_json"
     lidar_dirname: str = "lidar_xyzi"
     camera_root: str = "decoded_rgb"
-    camera_prefix: str = "camera_"   # camera_1 ~ camera_6
+    camera_prefix: str = "camera_"
     radar_dirs: Tuple[str, ...] = ("radar1", "radar2", "radar3")
 
     # 뷰어 디폴트
@@ -67,27 +58,78 @@ class AppConfig:
     tile_h: int = 480
     timeline_h: int = 300
     overview_h: int = 120
-    overview_base_color: tuple = (100, 100, 100)   # BGR gray 
-    overview_seg_color: tuple = (180, 120, 60)     # BGR blue 
-    overview_gps_allow_color: tuple = (30, 180, 60)  # 초록(= GPS 불가의 여집합, 사용 가능)
-    overview_gps_post_thick: int = 4                 # 초록 기둥/상단 두께
-    overview_base_thick: int = 12                 # 베이스 라인 두께
-    overview_post_thick: int = 4                  # 세그먼트 기둥/상단 두께
-    overview_min_pix: int = 6                     # 세그민트 최소 픽셀 폭
-    start_index_default: int = 100
+    overview_base_color: tuple = (100, 100, 100)
+    overview_seg_color: tuple = (180, 120, 60)
+    overview_gps_allow_color: tuple = (30, 180, 60)
+    overview_gps_post_thick: int = 4
+    overview_base_thick: int = 12
+    overview_post_thick: int = 4
+    overview_min_pix: int = 6
+    start_index_default: int = 0
 
-    # --- LiDAR 표시/색상 ---
-    lidar_cmap: str = "turbo_r"              # 예: "turbo", "viridis", "plasma", "jet", ...
+    # LiDAR 색/범위
+    lidar_cmap: str = "turbo_r"
     lidar_color_use_fixed_range: bool = True
-    lidar_color_min_m: float = 2.0         
-    lidar_color_max_m: float = 50.0        
-    lidar_max_display_range_m: float = 150.0  
+    lidar_color_min_m: float = 2.0
+    lidar_color_max_m: float = 50.0
+    lidar_max_display_range_m: float = 150.0
 
-    # CLip params
+    # Clip
     clip_min_frames: int = 200
 
-    
+    # 보정 파일
+    calib_yaml: Optional[Path] = Path("./calib_matrix/matrix0801.yaml")
 
+    # -----------------------
+    # 자동 유도 로직
+    # -----------------------
+    def __post_init__(self):
+        # 1) origin_root 자동 탐지: base_dir의 조상 중 이름이 *_origin 인 폴더
+        if self.origin_root is None:
+            self.origin_root = self._guess_origin_root(self.base_dir)
+
+        # 2) dataset_tag = <site 폴더명> (ex: gwangmyeong_land)
+        if self.dataset_tag is None:
+            try:
+                rel = self.base_dir.relative_to(self.origin_root)
+                self.dataset_tag = rel.parts[0]  # site 폴더
+            except Exception:
+                # 폴백: base_dir 바로 위 폴더명
+                self.dataset_tag = self.base_dir.parent.name
+
+        # 3) marks_json_root / final_clips_root 자동 유도
+        #    origin_root 이름의 접미사 "_origin"을 교체하는 규칙 사용
+        if self.marks_json_root is None:
+            self.marks_json_root = self._swap_root_suffix(self.origin_root, "_origin", "_marks_json")
+
+        if self.final_clips_root is None:
+            self.final_clips_root = self._swap_root_suffix(self.origin_root, "_origin", "_final_scenes")
+
+        # Path 보장
+        self.origin_root = Path(self.origin_root)
+        self.marks_json_root = Path(self.marks_json_root)
+        self.final_clips_root = Path(self.final_clips_root)
+        self.base_dir = Path(self.base_dir)
+
+    @staticmethod
+    def _guess_origin_root(base_dir: Path) -> Path:
+        # 가장 가까운 조상 중 이름이 *_origin 인 폴더를 찾음
+        for p in [base_dir] + list(base_dir.parents):
+            if p.name.endswith("_origin"):
+                return p
+        # 못 찾으면 base_dir의 2단계 위( site / acq 구조 가정 )로 폴백
+        if len(base_dir.parents) >= 2:
+            return base_dir.parents[2]
+        return base_dir
+
+    @staticmethod
+    def _swap_root_suffix(root: Path, old_suffix: str, new_suffix: str) -> Path:
+        if root.name.endswith(old_suffix):
+            return root.with_name(root.name[: -len(old_suffix)] + new_suffix)
+        # 접미사가 없으면 같은 상위 경로에 새 이름으로 생성
+        return root.parent / new_suffix
+
+# 전역 설정 객체 (나머지 코드는 그대로 사용)
 CFG = AppConfig()
 
 # =========================
