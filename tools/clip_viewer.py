@@ -35,15 +35,37 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 # ---------------------------------------
 def compute_marks_dirs(base_dir: Path):
     """
-    viewer_merge.py와 동일 규칙:
-    <base_dir.name>_marks_json/ 아래에
-      - merge_camera_gnss_json/
-      - final_clip/
-    을 사용 (camera/gnss는 clip 뷰어엔 필요 없음)
+    원본(origin) 루트 -> marks_json 루트로 치환해 저장 디렉터리 계산.
+    예)
+      base_dir = /mnt/e/off-road/offroad_dataset_origin/gwangmyeong_land/test0822_15_22
+      -> marks_root = /mnt/e/off-road/offroad_dataset_marks_json/gwangmyeong_land/test0822_15_22_marks_json
+         - merge_camera_gnss_json/
+         - final_clip/
     """
-    marks_root = base_dir.parent / f"{base_dir.name}_marks_json"
-    merge_dir = marks_root / "merge_camera_gnss_json"
+    # merge_viewer.CFG에서 루트 경로 읽기 (없으면 폴백)
+    origin_root = Path(getattr(V.CFG, "origin_root", "") or "")
+    marks_top   = Path(getattr(V.CFG, "marks_json_root", "") or "")
+
+    if base_dir and base_dir.exists():
+        # origin_root 기준 상대경로 산출 시도
+        try:
+            rel = base_dir.relative_to(origin_root) if origin_root else None
+        except Exception:
+            rel = None
+
+        if rel is not None and str(marks_top):
+            # /marks_json_root/<site>/<acq>_marks_json
+            marks_root = (marks_top / rel.parent / f"{rel.name}_marks_json").resolve()
+        else:
+            # 폴백: 기존 규칙 (base_dir 옆에 *_marks_json)
+            marks_root = (base_dir.parent / f"{base_dir.name}_marks_json").resolve()
+    else:
+        # 최종 폴백
+        marks_root = (marks_top if str(marks_top) else Path("./marks_json_root")).resolve()
+
+    merge_dir     = marks_root / "merge_camera_gnss_json"
     final_clip_dir = marks_root / "final_clip"
+
     merge_dir.mkdir(parents=True, exist_ok=True)
     final_clip_dir.mkdir(parents=True, exist_ok=True)
     return marks_root, merge_dir, final_clip_dir
@@ -108,6 +130,53 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self._last_pixmap = None
         self._build_ui()
         self._refresh_all()
+
+    def _start_export(self, marks_path: Path):
+        # 버튼 잠금 + 커서 변경 + 진행바 표시
+        self.btn_export.setEnabled(False)
+        self.prog.setVisible(True)
+        self.prog.setValue(0)
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        # 필요하면 base_dir_override 넘겨서 출발 루트 고정 가능
+        base_dir_override = self.dataset_base_dir
+
+        # QThread 구성 (viewer.py와 동일 패턴)
+        self._exp_thread = QtCore.QThread(self)
+        self._exp_worker = V.ExportWorker(
+            marks_path,
+            dataset_tag=V.CFG.dataset_tag,
+            base_dir_override=base_dir_override
+        )
+        self._exp_worker.moveToThread(self._exp_thread)
+        self._exp_thread.started.connect(self._exp_worker.run)
+
+        # 진행률/로그/종료 시그널 연결
+        self._exp_worker.progress.connect(self.prog.setValue)   # ← % 업데이트
+        self._exp_worker.log.connect(self._toast)               # 상태바에 로그
+        self._exp_worker.finished.connect(self._on_export_finished)
+
+        self._exp_thread.start()
+
+    def _on_export_finished(self):
+        try:
+            self.prog.setValue(100)
+        except Exception:
+            pass
+        self.btn_export.setEnabled(True)
+        self.prog.setVisible(False)
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+        # 정리
+        if hasattr(self, "_exp_worker"):
+            self._exp_worker.deleteLater()
+            del self._exp_worker
+        if hasattr(self, "_exp_thread"):
+            self._exp_thread.quit()
+            self._exp_thread.wait()
+            self._exp_thread.deleteLater()
+            del self._exp_thread
+
 
     # ---------------- UI ----------------
 
@@ -297,6 +366,12 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.btn_export = QtWidgets.QPushButton("Export Scenes…")
         self.btn_export.clicked.connect(self._export_from_clip_json)
         ev.addWidget(self.btn_export)
+
+        self.prog = QtWidgets.QProgressBar()
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+        self.prog.setVisible(False)  # 실행 시에만 보이게
+        ev.addWidget(self.prog)
 
         v.addWidget(exp)
 
@@ -775,8 +850,9 @@ class ClipViewer(V.QtWidgets.QMainWindow):
 
         # 3) 실제 Export 실행
         try:
-            V.export_scenes_from_marks(self.export_clip_path, dataset_tag=V.CFG.dataset_tag)
-            self._toast(f"Export done: {len(self._export_preview)} clip(s) → {self.export_clip_path.name}")
+            # V.export_scenes_from_marks(self.export_clip_path, dataset_tag=V.CFG.dataset_tag)
+            # self._toast(f"Export done: {len(self._export_preview)} clip(s) → {self.export_clip_path.name}")
+            self._start_export(self.export_clip_path)
         except Exception as e:
             self._toast(f"Export failed: {e}")
 

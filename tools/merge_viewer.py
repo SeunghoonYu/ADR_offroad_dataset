@@ -41,10 +41,15 @@ class AppConfig:
     worker_name: str = "TonyStark"
 
     # 데이터셋 루트 (읽기/marks_json 저장의 기준)
-    base_dir: Path = Path("/mnt/e/off-road/data_0822/test0822_15_22")
+    base_dir: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_origin/kwangmyeong_land/test0822_15_22")     # kwangmyeong_land, sihueng_land, sihueng_lake, siheung_farmland
+
+    # 수정본
+    origin_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_origin")
+    marks_json_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_marks_json")
+    final_clips_root: Path = Path("PATH/TO/YOUR/LOCAL_DATA_PATH/offroad_dataset_final_scenes")
 
     # 씬 export 네이밍 접두
-    dataset_tag: str = "Gwangmyeong_Hagon"
+    dataset_tag: str = "kwangmyeong_land"  # kwangmyeong_land, sihueng_land, sihueng_lake, siheung_farmland
 
     # 보정 파일 경로(없으면 기본 파라미터 사용)
     calib_yaml: Optional[Path] = Path("./calib_matrix/matrix0801.yaml")
@@ -1684,9 +1689,11 @@ def export_scenes_from_marks(marks_json_path: Path,
     else:
         log(f"[warn] IMU CSV not found at {base_dir / 'imu' / 'imu_data.csv'}")
 
-    root_name = _derive_root_name(base_dir, dataset_tag)
-    out_root = base_dir.parent / root_name
+    # root_name = _derive_root_name(base_dir, dataset_tag)
+    # out_root = base_dir.parent / root_name
+    out_root = _compute_final_out_root(base_dir, dataset_tag)
     ensure_dir(out_root)
+    root_name = out_root.name
 
     log(f"[info] Base dir     : {base_dir}")
     log(f"[info] Output root  : {out_root}")
@@ -3268,11 +3275,32 @@ def _find_latest_marks(marks_dir: Path, base_name: str) -> Optional[Path]:
     candidates = sorted(marks_dir.glob(f"{base_name}_syn_marks_*.json"))
     return candidates[-1] if candidates else None
 
+def _compute_final_out_root(base_dir: Path, dataset_tag: Optional[str]) -> Path:
+    """
+    base_dir: /.../offroad_dataset_origin/<site>/<acq>
+    -> /.../offroad_dataset_final_clips/<site>/<TAG_or_base>_scenes
+    """
+    origin_root = Path(getattr(CFG, "origin_root", "") or "")
+    finals_top  = Path(getattr(CFG, "final_clips_root", "") or "")
+    root_name   = _derive_root_name(base_dir, dataset_tag)  # 기존 규칙 유지
+
+    try:
+        rel = base_dir.relative_to(origin_root)  # <site>/<acq>
+    except Exception:
+        rel = None
+
+    if rel is not None and str(finals_top):
+        # /final_clips/<site>/<root_name>
+        return (finals_top / rel.parent / root_name).resolve()
+
+    # fallback: 예전처럼 <acq parent>/<root_name>
+    return (base_dir.parent / root_name).resolve()
+
+
 
 def initialize_data():
     global camera_files, lidar_files, calib_data, marks_json_path, dataset_base_dir
     global initial_allowed_next, initial_segment_id, initial_snap_start, initial_snap_end
-    # 추가: 다른 로직에서 재사용할 수 있도록 세 경로를 전역으로 노출
     global marks_root_dir, camera_json_dir, gnss_json_dir, merge_json_dir
 
     print("Loading scene metadata...")
@@ -3297,11 +3325,26 @@ def initialize_data():
     # base_dir 가 /mnt/e/off-road/data_0822/test0822_15_22 라면
     #   /mnt/e/off-road/data_0822/test0822_15_22_marks_json/ 아래에
     #   camera_lidar_json, gnss_lidar_json, merge_camera_gnss_json 생성
+
+    origin_root = CFG.origin_root
+    marks_top = CFG.marks_json_root
+
     if dataset_base_dir and dataset_base_dir.exists():
-        marks_root_dir = dataset_base_dir.parent / f"{dataset_base_dir.name}_marks_json"
+        # origin_root 기준 상대경로를 구해 marks_json_root로 치환
+        try:
+            rel = dataset_base_dir.relative_to(origin_root) if origin_root else None
+        except Exception:
+            rel = None
+
+        if rel is not None and str(marks_top):
+            # 예) marks_top/gwangmyeong_land/test0822_15_22_marks_json
+            marks_root_dir = (marks_top / rel.parent / f"{rel.name}_marks_json").resolve()
+        else:
+            # 폴백: 기존처럼 base_dir 옆에 *_marks_json
+            marks_root_dir = (dataset_base_dir.parent / f"{dataset_base_dir.name}_marks_json").resolve()
     else:
-        # dataset_base_dir 을 못 구했을 때의 안전한 폴백
-        marks_root_dir = Path("./marks_json_root")
+        # 최종 폴백
+        marks_root_dir = (marks_top if str(marks_top) else Path("./marks_json_root")).resolve()
 
     camera_json_dir = marks_root_dir / "camera_lidar_json"
     gnss_json_dir = marks_root_dir / "gnss_lidar_json"
