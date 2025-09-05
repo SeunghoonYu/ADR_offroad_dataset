@@ -64,7 +64,7 @@ def compute_marks_dirs(base_dir: Path):
         marks_root = (marks_top if str(marks_top) else Path("./marks_json_root")).resolve()
 
     merge_dir     = marks_root / "merge_camera_gnss_json"
-    final_clip_dir = marks_root / "final_clip"
+    final_clip_dir = marks_root / "final_clip_json"
 
     merge_dir.mkdir(parents=True, exist_ok=True)
     final_clip_dir.mkdir(parents=True, exist_ok=True)
