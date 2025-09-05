@@ -892,18 +892,18 @@ class ClipViewer(V.QtWidgets.QMainWindow):
                             canvas.strides[0], QtGui.QImage.Format.Format_BGR888)
         self._last_pixmap = QtGui.QPixmap.fromImage(qimg)
         self._update_canvas_scaled()
-        pix = QtGui.QPixmap.fromImage(qimg)
+        # pix = QtGui.QPixmap.fromImage(qimg)
 
-        s = float(self.view_scale)
-        if 0 < s < 1.0:
-            w = int(pix.width() * s)
-            h = int(pix.height() * s)
-            if w > 0 and h > 0:
-                pix = pix.scaled(w, h,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation)
+        # s = float(self.view_scale)
+        # if 0 < s < 1.0:
+        #     w = int(pix.width() * s)
+        #     h = int(pix.height() * s)
+        #     if w > 0 and h > 0:
+        #         pix = pix.scaled(w, h,
+        #                         Qt.AspectRatioMode.KeepAspectRatio,
+        #                         Qt.TransformationMode.SmoothTransformation)
 
-        self.lbl_canvas.setPixmap(pix)
+        # self.lbl_canvas.setPixmap(pix)
 
     def _refresh_seg_label(self):
         self.lbl_seg.setText(f"allowed_next = {self.allowed_next} | segment_id = {self.segment_id}")
