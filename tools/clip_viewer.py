@@ -219,7 +219,7 @@ class ClipViewer(V.QtWidgets.QMainWindow):
         self.center = QtWidgets.QWidget()
         self.center_v = QtWidgets.QVBoxLayout(self.center)
         self.center_v.setContentsMargins(0, 0, 0, 0)
-        self.center_v.setSpacing(6)
+        self.center_v.setSpacing(1)
 
         self.lbl_canvas = QtWidgets.QLabel()
         self.lbl_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)

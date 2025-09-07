@@ -33,7 +33,7 @@ from functools import lru_cache
 @dataclass
 class AppConfig:
     # 필수
-    base_dir: Path = Path("/media/ysh/T7 Shield/off-road/offroad_dataset_origin/siheung_land/test0826_18_06")
+    base_dir: Path = Path("/media/ysh/T7/offroad_dataset_origin/siheung_farmland/test0828_11_51")
     worker_name: str = "sh" 
 
     # 선택 입력(안 주면 base_dir로 자동 계산)
@@ -1817,64 +1817,64 @@ def export_scenes_from_marks(marks_json_path: Path,
                 dst_cam = out_cams[i] / f"{li_ts_str}_{k:06d}.jpg"
                 copy_file(src_cam, dst_cam)
 
-            # # Radars (가까운 ts 골라서)   # this is 10hz matching with lidar
-            # for r in range(3):
-            #     if not radar_files[r]:
-            #         continue
-            #     idx = _nearest_index(radar_times[r], li_ts_val)
-            #     if idx is None:
-            #         continue
-            #     src_radar = radar_files[r][idx]
-            #     dst_radar = out_radars[r] / f"{li_ts_str}_{k:06d}.bin"
-            #     copy_file(src_radar, dst_radar)
+            # Radars (가까운 ts 골라서)   # this is 10hz matching with lidar
+            for r in range(3):
+                if not radar_files[r]:
+                    continue
+                idx = _nearest_index(radar_times[r], li_ts_val)
+                if idx is None:
+                    continue
+                src_radar = radar_files[r][idx]
+                dst_radar = out_radars[r] / f"{li_ts_str}_{k:06d}.bin"
+                copy_file(src_radar, dst_radar)
 
             done_frames += 1
             if progress_cb:
                 progress_cb(done_frames, total_frames)
 
-        # ---- RADAR 벌크 복사 (LiDAR start~end 사이 전부) ----
-        radar_copied_counts = [0,0,0]
-        try:
-            if seg_len > 0:
-                # LiDAR 구간의 시작/끝 시각 (float sec)
-                t_start = ts_float_from_path(lidar_xyzi_files[l0])
-                t_end   = ts_float_from_path(lidar_xyzi_files[l0 + seg_len - 1])
-                if (t_start is not None) and (t_end is not None):
-                    for r in range(3):
-                        times = radar_times[r]
-                        files = radar_files[r]
-                        if not files or times is None or len(times) == 0:
-                            continue
+        # # ---- RADAR 벌크 복사 (LiDAR start~end 사이 전부) ----
+        # radar_copied_counts = [0,0,0]
+        # try:
+        #     if seg_len > 0:
+        #         # LiDAR 구간의 시작/끝 시각 (float sec)
+        #         t_start = ts_float_from_path(lidar_xyzi_files[l0])
+        #         t_end   = ts_float_from_path(lidar_xyzi_files[l0 + seg_len - 1])
+        #         if (t_start is not None) and (t_end is not None):
+        #             for r in range(3):
+        #                 times = radar_times[r]
+        #                 files = radar_files[r]
+        #                 if not files or times is None or len(times) == 0:
+        #                     continue
 
-                        # t_start 이상, t_end 이하 범위 인덱스 구하기
-                        # (left: 첫 >= t_start, right: 마지막 <= t_end)
-                        import numpy as np
-                        i0 = int(np.searchsorted(times, t_start, side='left'))
-                        i1 = int(np.searchsorted(times, t_end,   side='right')) - 1
+        #                 # t_start 이상, t_end 이하 범위 인덱스 구하기
+        #                 # (left: 첫 >= t_start, right: 마지막 <= t_end)
+        #                 import numpy as np
+        #                 i0 = int(np.searchsorted(times, t_start, side='left'))
+        #                 i1 = int(np.searchsorted(times, t_end,   side='right')) - 1
 
-                        # 경계 보정 및 비어있는 경우 스킵
-                        i0 = max(0, min(i0, len(files)-1))
-                        i1 = max(-1, min(i1, len(files)-1))
-                        if i1 < i0:
-                            continue
+        #                 # 경계 보정 및 비어있는 경우 스킵
+        #                 i0 = max(0, min(i0, len(files)-1))
+        #                 i1 = max(-1, min(i1, len(files)-1))
+        #                 if i1 < i0:
+        #                     continue
 
-                        copied = 0
-                        for j in range(i0, i1+1):
-                            src_radar = files[j]
-                            # 레이더 파일명에서 타임스탬프 추출 (예: "sec_nsec")
-                            ts_r = ts_str_from_path(src_radar) or _ts(src_radar)
-                            dst_radar = out_radars[r] / f"{ts_r}.bin"   # ← 레이더 자체 ts 사용
-                            copy_file(src_radar, dst_radar)
-                            copied += 1
-                        radar_copied_counts[r] = copied
-                        log(f"[ok][scene {sid}] radar{r+1} bulk-copied: {copied} files "
-                            f"(range idx {i0}..{i1})")
-                else:
-                    log(f"[warn][scene {sid}] Radar bulk copy skipped (LiDAR timestamps missing)")
-            else:
-                log(f"[info][scene {sid}] Radar not copied (empty segment)")
-        except Exception as e:
-            log(f"[warn][scene {sid}] Radar bulk copy failed: {e}")
+        #                 copied = 0
+        #                 for j in range(i0, i1+1):
+        #                     src_radar = files[j]
+        #                     # 레이더 파일명에서 타임스탬프 추출 (예: "sec_nsec")
+        #                     ts_r = ts_str_from_path(src_radar) or _ts(src_radar)
+        #                     dst_radar = out_radars[r] / f"{ts_r}.bin"   # ← 레이더 자체 ts 사용
+        #                     copy_file(src_radar, dst_radar)
+        #                     copied += 1
+        #                 radar_copied_counts[r] = copied
+        #                 log(f"[ok][scene {sid}] radar{r+1} bulk-copied: {copied} files "
+        #                     f"(range idx {i0}..{i1})")
+        #         else:
+        #             log(f"[warn][scene {sid}] Radar bulk copy skipped (LiDAR timestamps missing)")
+        #     else:
+        #         log(f"[info][scene {sid}] Radar not copied (empty segment)")
+        # except Exception as e:
+        #     log(f"[warn][scene {sid}] Radar bulk copy failed: {e}")
 
 
         # ---- IMU 잘라 저장 (LiDAR start/end 구간) ----
@@ -1984,9 +1984,9 @@ def export_scenes_from_marks(marks_json_path: Path,
             "cam_ranges": [[c0[i], c0[i] + seg_len - 1] for i in range(6)],
             "mode": "copy",
             "radars": {
-                "radar1": radar_copied_counts[0],
-                "radar2": radar_copied_counts[1],
-                "radar3": radar_copied_counts[2],
+                "radar1": len(radar_files[0]),
+                "radar2": len(radar_files[1]),
+                "radar3": len(radar_files[2]),
             },
             "imu": {
                 "source": str(imu_src) if imu_src else None,
