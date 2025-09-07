@@ -1451,7 +1451,8 @@ def export_scenes_from_marks(marks_json_path: Path,
                              dataset_tag: Optional[str] = "test",
                              log_cb=None,
                              progress_cb: Optional[Callable[[int,int], None]] = None,
-                             base_dir_override: Optional[Path] = None):
+                             base_dir_override: Optional[Path] = None,
+                             out_root_override: Optional[Path] = None):
     """
     marks_json을 읽어 start/end 쌍 단위로 실제 파일을
     {OUT_ROOT}/{root_name}_{sid}/ 이하에 copy.
@@ -1733,9 +1734,14 @@ def export_scenes_from_marks(marks_json_path: Path,
 
     # root_name = _derive_root_name(base_dir, dataset_tag)
     # out_root = base_dir.parent / root_name
-    out_root = _compute_final_out_root(base_dir, dataset_tag)
-    ensure_dir(out_root)
-    root_name = out_root.name
+    if out_root_override is not None:
+        out_root = out_root_override
+        ensure_dir(out_root)
+        root_name = out_root.name
+    else:
+        out_root = _compute_final_out_root(base_dir, dataset_tag)
+        ensure_dir(out_root)
+        root_name = out_root.name
 
     log(f"[info] Base dir     : {base_dir}")
     log(f"[info] Output root  : {out_root}")
