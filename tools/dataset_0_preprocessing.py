@@ -4,12 +4,12 @@ import glob
 import numpy as np
 import cv2
 
-from sensor_msgs.msg import PointCloud2
-import sensor_msgs_py.point_cloud2 as pc2
-from rclpy.serialization import deserialize_message
+# from sensor_msgs.msg import PointCloud2
+# import sensor_msgs_py.point_cloud2 as pc2
+# from rclpy.serialization import deserialize_message
 
 # ====== 공통 설정 ======
-INPUT_BASE = 'E:/off-road/test0807_15_11'
+INPUT_BASE = '/media/ysh/T7/offroad_dataset_origin/siheung_farmland/test0828_12_53'
 
 # ====== LiDAR 설정 ======
 LIDAR_INPUT_DIR = os.path.join(INPUT_BASE, 'lidar')
@@ -20,27 +20,27 @@ CAM_OUTPUT_BASE = os.path.join(INPUT_BASE, 'decoded_rgb')
 NUM_CAMERAS = 6
 BAYER_CONVERSION = cv2.COLOR_BAYER_BG2BGR  # RGGB 패턴이라면 cv2.COLOR_BAYER_RG2BGR
 
-# ====== LiDAR 처리 ======
-def decode_lidar():
-    os.makedirs(LIDAR_OUTPUT_DIR, exist_ok=True)
-    bin_files = sorted(glob.glob(os.path.join(LIDAR_INPUT_DIR, '*.bin')))
-    print(f"[LiDAR] Found {len(bin_files)} bin files.")
+# # ====== LiDAR 처리 ======
+# def decode_lidar():
+#     os.makedirs(LIDAR_OUTPUT_DIR, exist_ok=True)
+#     bin_files = sorted(glob.glob(os.path.join(LIDAR_INPUT_DIR, '*.bin')))
+#     print(f"[LiDAR] Found {len(bin_files)} bin files.")
 
-    for f in bin_files:
-        with open(f, 'rb') as raw:
-            msg = deserialize_message(raw.read(), PointCloud2)
-            points = list(pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True))
+#     for f in bin_files:
+#         with open(f, 'rb') as raw:
+#             msg = deserialize_message(raw.read(), PointCloud2)
+#             points = list(pc2.read_points(msg, field_names=("x", "y", "z", "intensity"), skip_nans=True))
 
-        if not points:
-            print(f"[LiDAR] Skip empty pointcloud: {f}")
-            continue
+#         if not points:
+#             print(f"[LiDAR] Skip empty pointcloud: {f}")
+#             continue
 
-        arr = np.array([[p[0], p[1], p[2], p[3]] for p in points], dtype=np.float32)
-        fname = os.path.basename(f).replace('.bin', 'xyzi.bin')
-        save_path = os.path.join(LIDAR_OUTPUT_DIR, fname)
-        arr.tofile(save_path)
+#         arr = np.array([[p[0], p[1], p[2], p[3]] for p in points], dtype=np.float32)
+#         fname = os.path.basename(f).replace('.bin', 'xyzi.bin')
+#         save_path = os.path.join(LIDAR_OUTPUT_DIR, fname)
+#         arr.tofile(save_path)
 
-        print(f"[LiDAR] Saved: {save_path}  shape={arr.shape}")
+#         print(f"[LiDAR] Saved: {save_path}  shape={arr.shape}")
 
 # ====== Camera 처리 ======
 def ensure_cam_dirs():
@@ -74,5 +74,5 @@ def decode_camera():
 
 # ====== 실행 진입점 ======
 if __name__ == '__main__':
-    decode_lidar()
+    # decode_lidar()
     decode_camera()
