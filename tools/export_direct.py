@@ -12,9 +12,9 @@ import sys
 import merge_viewer as V  # 같은 디렉토리에 merge_viewer.py 필요
 
 # ===== 여기만 수정 =====
-CLIP_JSON = Path("/absolute/path/to/final_clip_json/clip_xxx.json")
-OUT_ROOT  = Path("/absolute/path/to/my_export_dir")   # 강제로 저장할 경로
-BASE_DIR  = None  # 필요하면 Path("/mnt/e/off-road/..."), 없으면 None
+CLIP_JSON = Path("/mnt/mydisk/offroad_dataset_marks_json/siheung_lake/test0827_14_42_marks_json/final_clip_json/final_clip_test0827_14_42.json")
+OUT_ROOT  = Path("/mnt/mydisk/offroad_dataset_final_scenes/siheung_lake/test0827_14_42")   # 강제로 저장할 경로
+BASE_DIR  = Path("/mnt/mydisk/offroad_dataset_origin/siheung_lake/test0827_14_42")
 # ======================
 
 def _log_cb(msg: str):
